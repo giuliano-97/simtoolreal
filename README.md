@@ -50,7 +50,11 @@ simtoolreal
 
 # Installation
 
-The recommended setup runs SimToolReal in **Isaac Sim** (via Isaac Lab, Python 3.11, pip-installable): see the [IsaacSim Installation](docs/isaacsim_installation.md) documentation.
+The recommended setup runs SimToolReal in **Isaac Sim** (via Isaac Lab, Python 3.11, pip-installable): see the [IsaacSim Installation](docs/isaacsim_installation.md) documentation. Besides the step-by-step install, it can be set up with one command from the repo root:
+
+```bash
+UV_PROJECT_ENVIRONMENT="$PWD/.venv_isaacsim" uv sync --project envs/isaacsim
+```
 
 The legacy **Isaac Gym** environment (Python 3.8, manual binary download) is covered in the [IsaacGym Installation](docs/isaacgym_installation.md) documentation. The two environments live in separate venvs (`.venv_isaacsim` and `.venv`) and can coexist.
 

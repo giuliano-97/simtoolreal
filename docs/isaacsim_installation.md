@@ -11,6 +11,10 @@ The `isaacsimenvs/` package runs the SimToolReal task in Isaac Sim via Isaac Lab
 
 ## Install
 
+There are two ways to set up `.venv_isaacsim/`, and both produce an equivalent environment: the original step-by-step `uv pip` install, or a single `uv sync` against a lockfile. Run either one from the repo root.
+
+### Step-by-step (`uv pip`)
+
 ```bash
 uv venv .venv_isaacsim --python 3.11
 
@@ -40,13 +44,34 @@ uv pip install --python .venv_isaacsim/bin/python -e . --no-deps
 
 Keep the version pins exact (`isaaclab==2.3.2.post1`, torch 2.7.x+cu126) — newer Isaac Lab releases change `DirectRLEnv` / `UrdfConverter` APIs that `isaacsimenvs` depends on.
 
-Verify:
+### One-step (`uv sync`)
 
 ```bash
-.venv_isaacsim/bin/python -c "
-import torch, isaaclab, isaacsimenvs
+UV_PROJECT_ENVIRONMENT="$PWD/.venv_isaacsim" uv sync --project envs/isaacsim
+```
+
+This creates `.venv_isaacsim/` with Python 3.11 and installs the exact versions pinned in `envs/isaacsim/uv.lock` (~15 GB download; the first launch builds RTX shaders and takes ~2-5 min). Re-run the same command after pulling changes to bring the venv up to date. `UV_PROJECT_ENVIRONMENT` must be an absolute path, because uv resolves relative paths against `envs/isaacsim/`.
+
+What `envs/isaacsim/pyproject.toml` sets up:
+
+- PyTorch 2.7.0 for CUDA 12.6 from the PyTorch index (Isaac Sim 5.1 pins this version).
+- `isaaclab[isaacsim,all]==2.3.2.post1` from `pypi.nvidia.com`. Keep the pin exact: newer Isaac Lab releases change the `DirectRLEnv` / `UrdfConverter` APIs that `isaacsimenvs` depends on.
+- The vendored `rl_games/` (editable), plus the inference and CoACD dependencies.
+- The repo-local packages (`isaacsimenvs`, `isaacgymenvs`, `deployment`, ...), installed editable. The env doesn't depend on the root `pyproject.toml`, which pins `numpy==1.23.0`, `warp-lang==0.10.1` and `isaacgym-stubs` for the Isaac Gym env; all of those conflict with Python 3.11 / Isaac Sim. If you add a top-level package to the root `pyproject.toml`, add it to `envs/isaacsim/pyproject.toml` too.
+- An override that raises `typing_extensions` to `>=4.13`. `isaacsim-kernel` pins 4.12.2, but `tyro.cli` (used by `dextoolbench/generate_collision_meshes.py`) needs `NoExtraItems`, which first appeared in 4.13.
+
+To change dependencies, edit `envs/isaacsim/pyproject.toml`, run `uv lock --project envs/isaacsim`, and commit the updated `uv.lock`.
+
+### Verify
+
+This imports `isaaclab`, which asks for the EULA unless it's accepted through the env var. It only checks that `isaacsimenvs` can be found and doesn't import it, because `isaacsimenvs` needs `AppLauncher` to run first (see Gotchas):
+
+```bash
+OMNI_KIT_ACCEPT_EULA=YES .venv_isaacsim/bin/python -c "
+import importlib.util, torch, isaaclab
 print('torch:', torch.__version__, 'cuda:', torch.cuda.is_available())
 print('isaaclab:', isaaclab.__file__)
+print('isaacsimenvs:', importlib.util.find_spec('isaacsimenvs').origin)
 "
 ```
 
