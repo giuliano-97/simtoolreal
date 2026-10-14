@@ -50,7 +50,7 @@ simtoolreal
 
 # Installation
 
-The recommended setup runs SimToolReal in **Isaac Sim** (via Isaac Lab, Python 3.11, pip-installable): see the [IsaacSim Installation](docs/isaacsim_installation.md) documentation. Besides the step-by-step install, it can be set up with one command from the repo root:
+The recommended setup runs SimToolReal in **Isaac Sim** (Isaac Sim 6.1 via Isaac Lab 3.0, Python 3.12, pip-installable): see the [IsaacSim Installation](docs/isaacsim_installation.md) documentation. Besides the step-by-step install, it can be set up with one command from the repo root:
 
 ```bash
 UV_PROJECT_ENVIRONMENT="$PWD/.venv_isaacsim" uv sync --project envs/isaacsim
@@ -92,7 +92,6 @@ We recommend training in Isaac Sim. Training logs are tracked with [Weights & Bi
 .venv_isaacsim/bin/python isaacsimenvs/train.py \
 --task Isaacsimenvs-SimToolReal-Direct-v0 \
 --agent rl_games_sapg_cfg_entry_point \
---headless \
 --capture_viewer \
 --wandb_activate \
 --wandb_project <project> \

@@ -19,12 +19,11 @@ import numpy as np
 
 from isaacsimenvs.utils.interactive_viewer import create_html, make_embedded_robot, make_url_robot
 
-from .utils.scene_utils import JOINT_NAMES_CANONICAL
+from simtoolreal_shared.robots import KUKA_IIWA14
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 GITHUB_RAW_BASE_MAIN = "https://raw.githubusercontent.com/tylerlum/simtoolreal/main/"
-ROBOT_URDF_RELATIVE_PATH = "assets/urdf/kuka_sharpa_description/iiwa14_left_sharpa_adjusted_restricted.urdf"
 TABLE_URDF_PATH = REPO_ROOT / "assets" / "urdf" / "table_narrow.urdf"
 
 
@@ -36,15 +35,10 @@ def _to_numpy(value: Any) -> np.ndarray:
     return np.asarray(value, dtype=np.float32)
 
 
-def _quat_wxyz_to_xyzw(quat) -> np.ndarray:
-    quat_np = _to_numpy(quat)
-    return quat_np[[1, 2, 3, 0]]
-
-
-def _pose_xyzw(pos, quat_wxyz) -> np.ndarray:
+def _pose_xyzw(pos, quat_xyzw) -> np.ndarray:
     pose = np.zeros(7, dtype=np.float32)
     pose[:3] = _to_numpy(pos)
-    pose[3:] = _quat_wxyz_to_xyzw(quat_wxyz)
+    pose[3:] = _to_numpy(quat_xyzw)
     return pose
 
 
@@ -176,30 +170,30 @@ def capture_pose_viewer_frame(env, env_id: int) -> dict[str, Any]:
     origin = env.scene.env_origins[env_id]
 
     if hasattr(env, "_perm_lab_to_canon"):
-        joint_pos = env.robot.data.joint_pos[env_id, env._perm_lab_to_canon]
-        joint_names = list(JOINT_NAMES_CANONICAL)
+        joint_pos = env.robot.data.joint_pos.torch[env_id, env._perm_lab_to_canon]
+        joint_names = list(env.robot_spec.joint_names_canonical)
     else:
-        joint_pos = env.robot.data.joint_pos[env_id]
-        joint_names = list(env.robot.data.joint_names)
+        joint_pos = env.robot.data.joint_pos.torch[env_id]
+        joint_names = list(env.robot.joint_names)
 
-    robot_root_pos = env.robot.data.root_pos_w[env_id] - origin
-    object_pos = env.object.data.root_pos_w[env_id] - origin
-    goal_pos = env.goal_viz.data.root_pos_w[env_id] - origin
-    table_pos = env.table.data.root_pos_w[env_id] - origin
+    robot_root_pos = env.robot.data.root_pos_w.torch[env_id] - origin
+    object_pos = env.object.data.root_pos_w.torch[env_id] - origin
+    goal_pos = env.goal_viz.data.root_pos_w.torch[env_id] - origin
+    table_pos = env.table.data.root_pos_w.torch[env_id] - origin
     hole = getattr(env, "hole", None)
 
     frame = {
         "env_id": int(env_id),
         "robot_joint_names": joint_names,
         "robot_joint_pos": _to_numpy(joint_pos),
-        "robot_base_pose": _pose_xyzw(robot_root_pos, env.robot.data.root_quat_w[env_id]),
-        "object_pose": _pose_xyzw(object_pos, env.object.data.root_quat_w[env_id]),
-        "goal_pose": _pose_xyzw(goal_pos, env.goal_viz.data.root_quat_w[env_id]),
-        "table_pose": _pose_xyzw(table_pos, env.table.data.root_quat_w[env_id]),
+        "robot_base_pose": _pose_xyzw(robot_root_pos, env.robot.data.root_quat_w.torch[env_id]),
+        "object_pose": _pose_xyzw(object_pos, env.object.data.root_quat_w.torch[env_id]),
+        "goal_pose": _pose_xyzw(goal_pos, env.goal_viz.data.root_quat_w.torch[env_id]),
+        "table_pose": _pose_xyzw(table_pos, env.table.data.root_quat_w.torch[env_id]),
     }
     if hole is not None:
-        hole_pos = hole.data.root_pos_w[env_id] - origin
-        frame["hole_pose"] = _pose_xyzw(hole_pos, hole.data.root_quat_w[env_id])
+        hole_pos = hole.data.root_pos_w.torch[env_id] - origin
+        frame["hole_pose"] = _pose_xyzw(hole_pos, hole.data.root_quat_w.torch[env_id])
     return frame
 
 
@@ -214,6 +208,7 @@ def build_pose_viewer_html(
     hole_urdf_path: Path | None = None,
     github_raw_base: str | None = None,
     url_check: str = "skip",
+    robot_urdf_relative_path: str = KUKA_IIWA14.urdf_path,
 ) -> str:
     """Build a self-contained-ish viewer HTML string from captured frames.
 
@@ -225,7 +220,7 @@ def build_pose_viewer_html(
         raise ValueError("Cannot build pose viewer from zero frames.")
 
     raw_base = _normalize_raw_base(github_raw_base)
-    robot_urdf_url = raw_base + ROBOT_URDF_RELATIVE_PATH
+    robot_urdf_url = raw_base + robot_urdf_relative_path
     _check_url(robot_urdf_url, url_check)
     if object_urdf_path is not None:
         object_urdf_text = _rewrite_embedded_urdf_mesh_urls(
@@ -419,6 +414,7 @@ class SimToolRealPoseViewerWrapper(gym.Wrapper):
             hole_urdf_path=self._hole_urdf_path,
             github_raw_base=self.github_raw_base,
             url_check=self.url_check,
+            robot_urdf_relative_path=self.env.unwrapped.robot_spec.urdf_path,
         )
         html_path.write_text(html_text, encoding="utf-8")
         print(f"[pose_viewer] wrote {len(frames)} frames to {html_path}", flush=True)

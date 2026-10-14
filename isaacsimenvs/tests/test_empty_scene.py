@@ -71,7 +71,7 @@ def main():
             ),
             offset=CameraCfg.OffsetCfg(
                 pos=(0.0, -1.0, 1.03),
-                rot=(0.8507, 0.5257, 0.0, 0.0),
+                rot=(0.5257, 0.0, 0.0, 0.8507),
                 convention="opengl",
             ),
         )
@@ -86,7 +86,7 @@ def main():
         sim.step(render=args.video)
         if camera is not None and step_i % capture_every == 0:
             camera.update(capture_every * dt)
-            rgb = camera.data.output["rgb"]
+            rgb = camera.data.output["rgb"].torch
             if rgb is not None and rgb.shape[0] > 0:
                 frames.append(rgb[0].cpu().numpy()[:, :, :3])
 

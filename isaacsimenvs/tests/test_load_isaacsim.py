@@ -10,7 +10,7 @@ from isaaclab.app import AppLauncher
 def main():
     parser = argparse.ArgumentParser()
     AppLauncher.add_app_launcher_args(parser)
-    args = parser.parse_args(["--headless"])
+    args = parser.parse_args([])
 
     app_launcher = AppLauncher(args)
     app = app_launcher.app

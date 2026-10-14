@@ -36,7 +36,7 @@ _OBJECT_BASE_SIZE = 0.04
 # ----------------------------------------------------------------------------
 
 
-# All procedural object URDFs use this same link name so MultiUsdFileCfg-spawned
+# All procedural object URDFs use this same link name so the per-env object
 # prims have an identical internal structure across envs (env_*/Object/<LINK>).
 # RigidObject's view regex is derived from env_0's structure and applied to all
 # envs; if the link name varies, only matching envs are registered and

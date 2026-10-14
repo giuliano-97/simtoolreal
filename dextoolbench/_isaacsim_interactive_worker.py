@@ -24,12 +24,12 @@ CONTROL_DT = 1.0 / 60.0
 
 def _write_isaac_trajectory(goals_xyzw, out_dir: Path) -> str:
     """gym-format goals ([x,y,z,qx,qy,qz,qw] list) -> fixed_trajectory_file
-    format (pos (1,K,3), quat wxyz (1,K,4))."""
+    format (pos (1,K,3), quat xyzw (1,K,4))."""
     pos = [[g[:3] for g in goals_xyzw]]
-    quat_wxyz = [[[g[6], g[3], g[4], g[5]] for g in goals_xyzw]]
+    quat_xyzw = [[g[3:7] for g in goals_xyzw]]
     path = out_dir / "trajectory_isaac_format.json"
     with open(path, "w") as f:
-        json.dump({"pos": pos, "quat_wxyz": quat_wxyz}, f)
+        json.dump({"pos": pos, "quat_xyzw": quat_xyzw}, f)
     return str(path)
 
 
@@ -46,9 +46,8 @@ def _sim_get_state(inner, obs):
     origin = inner.scene.env_origins[0].detach().cpu().numpy()
 
     def _pose7(rigid):
-        pos = rigid.data.root_pos_w[0].detach().cpu().numpy() - origin
-        wxyz = rigid.data.root_quat_w[0].detach().cpu().numpy()
-        xyzw = wxyz[[1, 2, 3, 0]]
+        pos = rigid.data.root_pos_w.torch[0].detach().cpu().numpy() - origin
+        xyzw = rigid.data.root_quat_w.torch[0].detach().cpu().numpy()
         return np.concatenate([pos, xyzw]).astype(np.float32)
 
     return joint_pos, _pose7(inner.object), _pose7(inner.goal_viz)
@@ -159,8 +158,7 @@ def sim_worker_isaacsim(conn, category, object_name, task_name, table_urdf,
         rs.table_reset_z = TABLE_Z
         rs.table_reset_z_range = 0.0
         rs.start_arm_higher = True
-        sp = traj_data["start_pose"]
-        rs.fixed_start_pose = (sp[0], sp[1], sp[2], sp[6], sp[3], sp[4], sp[5])
+        rs.fixed_start_pose = tuple(traj_data["start_pose"])
         rs.fixed_trajectory_file = traj_file
 
         dr = cfg.domain_randomization

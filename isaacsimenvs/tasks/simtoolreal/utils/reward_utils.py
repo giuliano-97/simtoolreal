@@ -94,7 +94,7 @@ def compute_rewards(env) -> torch.Tensor:
     rew_cfg = env.cfg.reward
     term_cfg = env.cfg.termination
     env_origins = env.scene.env_origins
-    obj_pos = env.object.data.root_pos_w - env_origins
+    obj_pos = env.object.data.root_pos_w.torch - env_origins
 
     lift_rew, lift_bonus_rew, new_lifted = lifting_reward(
         object_z=obj_pos[:, 2],
@@ -123,7 +123,7 @@ def compute_rewards(env) -> torch.Tensor:
     env._closest_keypoint_max_dist = new_closest_kp
 
     kuka_pen, hand_pen = action_penalty(
-        joint_vel=env.robot.data.joint_vel,
+        joint_vel=env.robot.data.joint_vel.torch,
         arm_ids=env._arm_joint_ids,
         hand_ids=env._hand_joint_ids,
         kuka_scale=rew_cfg.kuka_actions_penalty_scale,

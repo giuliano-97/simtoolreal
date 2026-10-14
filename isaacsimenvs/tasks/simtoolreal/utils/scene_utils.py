@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import shutil
 import tempfile
 import time
@@ -18,35 +17,22 @@ from isaaclab.utils.math import quat_from_angle_axis, quat_mul
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import Articulation, ArticulationCfg, RigidObject, RigidObjectCfg
 from isaaclab.sim.converters import UrdfConverter, UrdfConverterCfg
+from isaaclab import cloner
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, UsdFileCfg, spawn_ground_plane
-from isaaclab.sim.spawners.wrappers import MultiUsdFileCfg
 from isaaclab.sim.utils import find_matching_prim_paths, get_current_stage
+
+from simtoolreal_shared.robots import LEFT_SHARPA_HAND_JOINT_NAMES, RobotSpec
 
 from .generate_objects import generate_handle_head_urdfs
 
 
 # ----------------------------------------------------------------------------
-# Joint names / regexes / body names
+# Joint names / regexes / body names. Arm-specific names (arm joints, palm
+# body, policy joint order) come from the RobotSpec in env.robot_spec.
 # ----------------------------------------------------------------------------
 
-ARM_JOINT_REGEX = "iiwa14_joint_.*"
 HAND_JOINT_REGEX = "left_.*"
 
-# Legacy policy order; Isaac Lab tensors are permuted at action/obs boundaries.
-JOINT_NAMES_CANONICAL: tuple[str, ...] = (
-    "iiwa14_joint_1", "iiwa14_joint_2", "iiwa14_joint_3", "iiwa14_joint_4",
-    "iiwa14_joint_5", "iiwa14_joint_6", "iiwa14_joint_7",
-    "left_1_thumb_CMC_FE", "left_thumb_CMC_AA", "left_thumb_MCP_FE",
-    "left_thumb_MCP_AA", "left_thumb_IP",
-    "left_2_index_MCP_FE", "left_index_MCP_AA", "left_index_PIP", "left_index_DIP",
-    "left_3_middle_MCP_FE", "left_middle_MCP_AA", "left_middle_PIP", "left_middle_DIP",
-    "left_4_ring_MCP_FE", "left_ring_MCP_AA", "left_ring_PIP", "left_ring_DIP",
-    "left_5_pinky_CMC", "left_pinky_MCP_FE", "left_pinky_MCP_AA",
-    "left_pinky_PIP", "left_pinky_DIP",
-)
-assert len(JOINT_NAMES_CANONICAL) == 29
-
-PALM_BODY_NAME = "iiwa14_link_7"
 # Merged fingertip bodies land on the DP links in both sims.
 FINGERTIP_BODY_REGEX = "left_(index|middle|ring|thumb|pinky)_DP"
 FINGERTIP_LINK_NAMES: tuple[str, ...] = (
@@ -55,19 +41,8 @@ FINGERTIP_LINK_NAMES: tuple[str, ...] = (
 )
 
 
-# Per-joint PD gains and dynamics (verified with pretrained checkpoint).
-ARM_JOINT_STIFFNESS: dict[str, float] = {
-    "iiwa14_joint_1": 600.0, "iiwa14_joint_2": 600.0, "iiwa14_joint_3": 500.0,
-    "iiwa14_joint_4": 400.0, "iiwa14_joint_5": 200.0, "iiwa14_joint_6": 200.0,
-    "iiwa14_joint_7": 200.0,
-}
-ARM_JOINT_DAMPING: dict[str, float] = {
-    "iiwa14_joint_1": 27.027026473513512, "iiwa14_joint_2": 27.027026473513512,
-    "iiwa14_joint_3": 24.672186769721083, "iiwa14_joint_4": 22.067474708266914,
-    "iiwa14_joint_5": 9.752538131173853, "iiwa14_joint_6": 9.147747263670984,
-    "iiwa14_joint_7": 9.147747263670984,
-}
-
+# Per-joint hand PD gains and dynamics (verified with pretrained checkpoint).
+# Arm gains live in the RobotSpec.
 HAND_JOINT_STIFFNESS: dict[str, float] = {
     "left_1_thumb_CMC_FE": 6.95, "left_thumb_CMC_AA": 13.2, "left_thumb_MCP_FE": 4.76,
     "left_thumb_MCP_AA": 6.62, "left_thumb_IP": 0.9,
@@ -119,16 +94,8 @@ HAND_JOINT_FRICTION: dict[str, float] = {
     "left_pinky_MCP_AA": 0.07456, "left_pinky_PIP": 0.01276, "left_pinky_DIP": 0.00378738,
 }
 
-assert len(ARM_JOINT_STIFFNESS) == 7 and len(ARM_JOINT_DAMPING) == 7
-assert len(HAND_JOINT_STIFFNESS) == 22 and len(HAND_JOINT_DAMPING) == 22
-assert len(HAND_JOINT_ARMATURE) == 22 and len(HAND_JOINT_FRICTION) == 22
-
-# Proven-working default arm pose (isaacsim_conversion/isaacsim_env.py:101-109).
-ARM_DEFAULT_JOINT_POS: dict[str, float] = {
-    "iiwa14_joint_1": -1.571, "iiwa14_joint_2": 1.571, "iiwa14_joint_3": 0.0,
-    "iiwa14_joint_4": 1.376, "iiwa14_joint_5": 0.0, "iiwa14_joint_6": 1.485,
-    "iiwa14_joint_7": 1.308,
-}
+for _table in (HAND_JOINT_STIFFNESS, HAND_JOINT_DAMPING, HAND_JOINT_ARMATURE, HAND_JOINT_FRICTION):
+    assert set(_table) == set(LEFT_SHARPA_HAND_JOINT_NAMES)
 
 _CONTACT_OFFSET = 0.002
 _REST_OFFSET = 0.0
@@ -141,7 +108,6 @@ _PHYSICS_SPECS: dict[str, tuple[str, str, str]] = {
     "max_depenetration_velocity": ("rb", "physxRigidBody:maxDepenetrationVelocity", "Float"),
     "rb_solver_position_iterations": ("rb", "physxRigidBody:solverPositionIterationCount", "Int"),
     "rb_solver_velocity_iterations": ("rb", "physxRigidBody:solverVelocityIterationCount", "Int"),
-    "articulation_enabled": ("art", "physics:articulationEnabled", "Bool"),
     "enabled_self_collisions": ("art", "physxArticulation:enabledSelfCollisions", "Bool"),
     "solver_position_iterations": ("art", "physxArticulation:solverPositionIterationCount", "Int"),
     "solver_velocity_iterations": ("art", "physxArticulation:solverVelocityIterationCount", "Int"),
@@ -149,30 +115,29 @@ _PHYSICS_SPECS: dict[str, tuple[str, str, str]] = {
 
 
 def build_robot_articulation_usd_cfg(
-    usd_path: str, *, start_arm_higher: bool = False
+    usd_path: str, spec: RobotSpec, *, start_arm_higher: bool = False
 ) -> ArticulationCfg:
-    arm_default = dict(ARM_DEFAULT_JOINT_POS)
-    if start_arm_higher:
-        # Matches the gym env's startArmHigher eval pose.
-        arm_default["iiwa14_joint_2"] -= math.radians(10.0)
-        arm_default["iiwa14_joint_4"] += math.radians(10.0)
+    # The raised pose matches the gym env's startArmHigher eval pose.
+    arm_default = spec.arm_joint_dict(
+        spec.arm_start_higher_joint_pos if start_arm_higher else spec.arm_default_joint_pos
+    )
     return ArticulationCfg(
-        prim_path="/World/envs/env_.*/Robot",
+        prim_path="/World/envs/env_[^/]+/Robot",
         spawn=UsdFileCfg(usd_path=usd_path),
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0.0, 0.8, 0.0),
-            rot=(1.0, 0.0, 0.0, 0.0),
+            pos=spec.base_pos,
+            rot=spec.base_quat_xyzw,
             joint_pos={
                 **arm_default,
-                **{name: 0.0 for name in HAND_JOINT_STIFFNESS},
+                **{name: 0.0 for name in LEFT_SHARPA_HAND_JOINT_NAMES},
             },
             joint_vel={".*": 0.0},
         ),
         actuators={
             "arm": ImplicitActuatorCfg(
-                joint_names_expr=[ARM_JOINT_REGEX],
-                stiffness=ARM_JOINT_STIFFNESS,
-                damping=ARM_JOINT_DAMPING,
+                joint_names_expr=list(spec.arm_joint_names),
+                stiffness=spec.arm_joint_dict(spec.arm_joint_stiffness),
+                damping=spec.arm_joint_dict(spec.arm_joint_damping),
             ),
             "hand": ImplicitActuatorCfg(
                 joint_names_expr=[HAND_JOINT_REGEX],
@@ -184,12 +149,35 @@ def build_robot_articulation_usd_cfg(
     )
 
 
-def build_rigid_object_cfg(prim_path: str, usd_paths: list[str]) -> RigidObjectCfg:
-    """Spawn a RigidObject from one or more pre-baked USDs (round-robin)."""
-    return RigidObjectCfg(
-        prim_path=prim_path,
-        spawn=MultiUsdFileCfg(usd_path=list(usd_paths), random_choice=False),
+def spawn_round_robin_usds(env, name: str, usd_paths: list[str]) -> torch.Tensor:
+    """Spawn ``usd_paths[i % len(usd_paths)]`` at ``/World/envs/env_i/<name>``.
+
+    Isaac Lab 3's ``MultiUsdFileCfg`` only spawns prototypes for its scene
+    cloner, so per-env distinct assets are laid out here: each USD is spawned
+    once as a prototype in env k, then copied to every env i with
+    ``i % len(usd_paths) == k`` (Isaac Lab 2's ``MultiUsdFileCfg`` layout with
+    ``random_choice=False``). Returns the per-env index into ``usd_paths``.
+    """
+    num_envs = env.num_envs
+    asset_index = torch.arange(num_envs) % len(usd_paths)
+    sources = []
+    for k, usd_path in enumerate(usd_paths[:num_envs]):
+        source = f"/World/envs/env_{k}/{name}"
+        UsdFileCfg(usd_path=usd_path).func(source, UsdFileCfg(usd_path=usd_path))
+        sources.append(source)
+    cloner.usd_replicate(
+        get_current_stage(),
+        sources=sources,
+        destinations=[f"/World/envs/env_{{}}/{name}"] * len(sources),
+        env_ids=torch.arange(num_envs),
+        mask=asset_index.unsqueeze(0) == torch.arange(len(sources)).unsqueeze(1),
     )
+    return asset_index
+
+
+def build_rigid_object_cfg(prim_path: str) -> RigidObjectCfg:
+    """RigidObject over prims already laid out by :func:`spawn_round_robin_usds`."""
+    return RigidObjectCfg(prim_path=prim_path, spawn=None)
 
 
 def _log_scene_step(start_time: float, message: str) -> None:
@@ -218,7 +206,7 @@ def hide_goal_viz_for_student_camera(env) -> None:
     from pxr import UsdGeom
 
     stage = get_current_stage()
-    goal_viz_paths = find_matching_prim_paths("/World/envs/env_.*/GoalViz")
+    goal_viz_paths = find_matching_prim_paths("/World/envs/env_[^/]+/GoalViz")
     for prim_path in goal_viz_paths:
         prim = stage.GetPrimAtPath(prim_path)
         if prim.IsValid():
@@ -229,14 +217,14 @@ def hide_goal_viz_for_student_camera(env) -> None:
     )
 
 
-def _quat_wxyz_to_rotmat(quat_wxyz: tuple) -> torch.Tensor:
-    """Standard (w, x, y, z) -> 3x3 rotation matrix.
+def _quat_xyzw_to_rotmat(quat_xyzw: tuple) -> torch.Tensor:
+    """Standard (x, y, z, w) -> 3x3 rotation matrix.
 
     Column 0 of the result is the camera's local +X axis in world coords,
     which for a ROS-convention camera ('+X = image right') is the
     direction toward the RIGHT eye of a stereo pair.
     """
-    w, x, y, z = (float(v) for v in quat_wxyz)
+    x, y, z, w = (float(v) for v in quat_xyzw)
     return torch.tensor([
         [1 - 2 * (y * y + z * z),     2 * (x * y - w * z),         2 * (x * z + w * y)],
         [    2 * (x * y + w * z), 1 - 2 * (x * x + z * z),         2 * (y * z - w * x)],
@@ -245,7 +233,7 @@ def _quat_wxyz_to_rotmat(quat_wxyz: tuple) -> torch.Tensor:
 
 
 def _stereo_right_pose_from_left(
-    left_pos: tuple, left_quat_wxyz: tuple, baseline_m: float
+    left_pos: tuple, left_quat_xyzw: tuple, baseline_m: float
 ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
     """Right-eye pose from left-eye pose + ZED-style horizontal baseline.
 
@@ -253,127 +241,93 @@ def _stereo_right_pose_from_left(
     same as the left's; only the position is offset by `baseline_m` along
     the left camera's local +X axis (image-right under ROS convention).
     """
-    R = _quat_wxyz_to_rotmat(left_quat_wxyz)
+    R = _quat_xyzw_to_rotmat(left_quat_xyzw)
     delta = float(baseline_m) * R[:, 0]
     right_pos = tuple(float(left_pos[i] + delta[i].item()) for i in range(3))
-    right_quat = tuple(float(v) for v in left_quat_wxyz)
+    right_quat = tuple(float(v) for v in left_quat_xyzw)
     return right_pos, right_quat
 
 
-def _diagnose_target_expr(expr: str) -> None:
-    """Echo what `_obtain_trackable_prim_view` will see for this expr.
+def _raycast_body_targets(root_expr: str) -> list[str]:
+    """One raycast target per rigid body under ``root_expr``, resolved on env_0.
 
-    Walks parents until hitting RigidBodyAPI / ArticulationRootAPI exactly
-    like the raycaster does, then prints `mesh_prims` and `view_prims`
-    counts. If they disagree, the worker will error with
-    "1 mesh prim vs N physics prims" and this print pinpoints which target.
+    URDF importer 3.0 nests articulation links, so an asset root or a link
+    prim also contains its child links; each body is tracked separately.
+    Bodies are named alike in every env (the round-robin object USDs all use
+    one link name), so env_0's layout applies to all.
     """
     from pxr import Usd, UsdPhysics
-    from isaaclab.sim.utils import find_matching_prims, find_first_matching_prim
 
-    try:
-        mesh_prim = find_first_matching_prim(expr)
-        if mesh_prim is None or not mesh_prim.IsValid():
-            print(f"[raycaster][diag]   {expr!r}: NO mesh prim match", flush=True)
-            return
-        cur_prim = mesh_prim
-        cur_expr = expr
-        depth = 0
-        while True:
-            depth += 1
-            if cur_prim.HasAPI(UsdPhysics.ArticulationRootAPI):
-                kind = "ArticulationRoot"
-                break
-            if cur_prim.HasAPI(UsdPhysics.RigidBodyAPI):
-                kind = "RigidBody"
-                break
-            parent = cur_prim.GetParent()
-            cur_expr = cur_expr.rsplit("/", 1)[0]
-            if not parent.IsValid() or depth > 10:
-                kind = "XForm(fallback)"
-                break
-            cur_prim = parent
-
-        mesh_paths = [str(p.GetPath()) for p in find_matching_prims(expr)]
-        view_paths = [str(p.GetPath()) for p in find_matching_prims(cur_expr)]
-        print(
-            f"[raycaster][diag]   target={expr!r}\n"
-            f"     -> walked up to {cur_prim.GetPath()} ({kind}), "
-            f"path_expr={cur_expr!r}\n"
-            f"     -> meshes ({len(mesh_paths)}): {mesh_paths}\n"
-            f"     -> views  ({len(view_paths)}): {view_paths}",
-            flush=True,
-        )
-    except Exception as exc:
-        print(f"[raycaster][diag]   {expr!r}: diag failed: {exc!r}", flush=True)
+    root = get_current_stage().GetPrimAtPath(root_expr.replace("/env_[^/]+", "/env_0"))
+    if not root.IsValid():
+        return []
+    root_path = str(root.GetPath())
+    return [
+        root_expr + str(prim.GetPath())[len(root_path):]
+        for prim in Usd.PrimRange(root)
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI)
+    ]
 
 
-def _expand_link_wildcard(expr: str, num_envs: int) -> list[str]:
-    """Resolve a `.../<wildcard>/visuals` raycast prim expression at setup
-    time.
+def _visual_raycaster_camera_cls():
+    """MultiMeshRayCasterCamera that ray-casts each target's visual geometry only.
 
-    The raycaster needs a 1-to-1 mapping between mesh prims (the leaves
-    matching the prim_expr) and physics-body view prims (the parent it
-    walks up to with RigidBodyAPI / ArticulationRootAPI). When the regex
-    component just before `/visuals` is a wildcard like `.*`, the walk-up
-    builds a `.../...*` view-prim expression that also matches sibling
-    non-link xforms (`Looks`, `joints`, ...), and the raycaster errors:
-        "The number of mesh prims (N) does not match the number of physics
-         prims (M)"
-
-    Fix: at setup time, list the actual link children that (a) match the
-    wildcard component, AND (b) have a `/visuals` subgroup with at least
-    one Gprim child. Return one explicit prim_expr per concrete link name,
-    preserving the `/visuals` tail. Callers who pass an expression without
-    a single wildcard between two slashes just get it back unchanged.
-
-    Example:
-        `/World/envs/env_.*/Object/.*/visuals`  ->
-            ["/World/envs/env_.*/Object/peg/visuals"]      # peg.tol0p5mm
-        or  ["/World/envs/env_.*/Object/lpeg/visuals"]     # Lpeg.tol0p5mm
-
-    For multi-link object URDFs (e.g. fabrica beam parts) we emit one
-    expression per link.
+    Isaac Lab merges every mesh under a target. URDF importer 3.0 puts a body's
+    collision hulls (guide purpose) next to its visual meshes and its child
+    links below it, so the stock loader would also hit hulls and child links.
     """
-    if "/.*/" not in expr:
-        return [expr]
-    # Split at the first wildcard component so we can list its concrete
-    # candidates against env_0 (clones share structure, so env_0 is enough).
-    head, tail = expr.split("/.*/", 1)
-    # Materialise `env_.*` in the head against env_0 for the stage lookup.
-    head_env0 = head.replace("/env_.*", "/env_0")
-    stage = get_current_stage()
-    parent_prim = stage.GetPrimAtPath(head_env0)
-    if not parent_prim.IsValid():
-        print(
-            f"[raycaster][expand] parent {head_env0!r} INVALID; keeping {expr!r}",
-            flush=True,
-        )
-        return [expr]
+    import numpy as np
+    import trimesh
+    from pxr import Usd, UsdGeom, UsdPhysics
 
-    # Walk children of `parent_prim`. Keep ones that look like URDF link
-    # subgroups (have a `/visuals` child), drop the materials / joints /
-    # sensor xforms the URDF importer also creates.
-    SKIP_NAMES = {"Looks", "joints", "Sensors", "joint_drives"}
-    concrete: list[str] = []
-    skipped: list[tuple[str, str]] = []
-    for child in parent_prim.GetChildren():
-        name = child.GetName()
-        if name in SKIP_NAMES:
-            skipped.append((name, "in SKIP_NAMES"))
-            continue
-        visuals_prim = stage.GetPrimAtPath(f"{head_env0}/{name}/visuals")
-        if not visuals_prim.IsValid():
-            skipped.append((name, "no /visuals child"))
-            continue
-        concrete.append(f"{head}/{name}/{tail}")
-    print(
-        f"[raycaster][expand] {expr!r} -> kept {len(concrete)}: "
-        f"{[c.rsplit('/', 2)[0].rsplit('/', 1)[1] for c in concrete]}; "
-        f"skipped {skipped}",
-        flush=True,
-    )
-    return concrete if concrete else [expr]
+    from isaaclab.sensors.ray_caster.base_multi_mesh_ray_caster import BaseMultiMeshRayCaster
+    from isaaclab.utils.math import matrix_from_quat
+    from isaaclab.utils.mesh import PRIMITIVE_MESH_TYPES, create_trimesh_from_geom_mesh, create_trimesh_from_geom_shape
+    from isaaclab.utils.warp import convert_to_warp_mesh
+    from isaaclab_physx.sensors.ray_caster.multi_mesh_ray_caster_camera import MultiMeshRayCasterCamera
+
+    def visual_geometry(target_prim) -> list:
+        prims = []
+        it = iter(Usd.PrimRange(target_prim, Usd.TraverseInstanceProxies()))
+        for prim in it:
+            if prim != target_prim and prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                it.PruneChildren()  # a child link, cast as its own target
+                continue
+            if prim.HasAPI(UsdPhysics.CollisionAPI) or UsdGeom.Imageable(prim).ComputePurpose() == "guide":
+                it.PruneChildren()
+                continue
+            if prim.GetTypeName() in PRIMITIVE_MESH_TYPES + ["Mesh"]:
+                prims.append(prim)
+        return prims
+
+    class VisualMultiMeshRayCasterCamera(MultiMeshRayCasterCamera):
+        def _load_target_prim_warp_mesh(self, target_prim, target_cfg, reference_prim=None) -> int:
+            reference_prim = target_prim if reference_prim is None else reference_prim
+            key = (f"{target_prim.GetPath()}@{reference_prim.GetPath()}", self._device)
+            if key in BaseMultiMeshRayCaster.meshes:
+                return BaseMultiMeshRayCaster.meshes[key].id
+            mesh_prims = visual_geometry(target_prim)
+            if not mesh_prims:
+                raise RuntimeError(f"No visual geometry to ray-cast under {target_prim.GetPath()}")
+            meshes = []
+            for mesh_prim in mesh_prims:
+                if mesh_prim.GetTypeName() == "Mesh":
+                    mesh = create_trimesh_from_geom_mesh(mesh_prim)
+                else:
+                    mesh = create_trimesh_from_geom_shape(mesh_prim)
+                mesh.apply_scale(sim_utils.resolve_prim_scale(mesh_prim))
+                pos, quat = sim_utils.resolve_prim_pose(mesh_prim, reference_prim)
+                transform = np.eye(4)
+                transform[:3, :3] = matrix_from_quat(torch.tensor(quat, dtype=torch.float64)).numpy()
+                transform[:3, 3] = pos
+                mesh.apply_transform(transform)
+                meshes.append(mesh)
+            mesh = meshes[0] if len(meshes) == 1 else trimesh.util.concatenate(meshes)
+            wp_mesh = convert_to_warp_mesh(mesh.vertices, mesh.faces, device=self._device)
+            BaseMultiMeshRayCaster.meshes[key] = wp_mesh
+            return wp_mesh.id
+
+    return VisualMultiMeshRayCasterCamera
 
 
 def setup_student_camera(env) -> None:
@@ -411,7 +365,7 @@ def setup_student_camera(env) -> None:
         camera_cfg_cls = TiledCameraCfg if backend == "tiled" else CameraCfg
         camera_cls = TiledCamera if backend == "tiled" else Camera
         camera_cfg = camera_cfg_cls(
-            prim_path="/World/envs/env_.*/StudentCamera",
+            prim_path="/World/envs/env_[^/]+/StudentCamera",
             update_period=float(getattr(cfg, "camera_update_period_s", 0.0)),
             update_latest_camera_pose=True,
             height=int(cfg.image_height),
@@ -431,7 +385,7 @@ def setup_student_camera(env) -> None:
             ),
             offset=camera_cfg_cls.OffsetCfg(
                 pos=tuple(float(x) for x in cfg.camera_pos),
-                rot=tuple(float(x) for x in cfg.camera_quat_wxyz),
+                rot=tuple(float(x) for x in cfg.camera_quat_xyzw),
                 convention=str(cfg.camera_convention),
             ),
         )
@@ -447,49 +401,37 @@ def setup_student_camera(env) -> None:
                 f"image_modality='depth' (got {cfg.image_modality!r}). "
                 "Use camera_backend='tiled' for RGB/semantic modalities."
             )
-        from isaaclab.sensors.ray_caster import (
-            MultiMeshRayCasterCamera,
-            MultiMeshRayCasterCameraCfg,
-            patterns,
-        )
+        from isaaclab.sensors.ray_caster import MultiMeshRayCasterCameraCfg, patterns
 
+        # The pattern takes aperture offsets normalized by the focal length
+        # (c = offset * f_px + size / 2); the config's are in aperture units.
         pattern_cfg = patterns.PinholeCameraPatternCfg(
             focal_length=float(cfg.focal_length),
             horizontal_aperture=float(cfg.horizontal_aperture),
             horizontal_aperture_offset=float(
                 getattr(cfg, "horizontal_aperture_offset", 0.0)
-            ),
+            ) / float(cfg.focal_length),
             vertical_aperture_offset=float(
                 getattr(cfg, "vertical_aperture_offset", 0.0)
-            ),
+            ) / float(cfg.focal_length),
             width=int(cfg.image_width),
             height=int(cfg.image_height),
         )
 
         raycast_targets = []
         for expr in tuple(cfg.raycast_static_prim_exprs):
-            print(f"[raycaster] STATIC target: {expr!r}", flush=True)
             raycast_targets.append(
                 MultiMeshRayCasterCameraCfg.RaycastTargetCfg(
                     prim_expr=str(expr), track_mesh_transforms=False
                 )
             )
         for expr in tuple(cfg.raycast_dynamic_prim_exprs):
-            expanded = _expand_link_wildcard(str(expr), env.num_envs)
-            print(
-                f"[raycaster] DYNAMIC target: {expr!r} -> "
-                f"{len(expanded)} concrete: {expanded}",
-                flush=True,
-            )
-            for concrete_expr in expanded:
-                # Verify mesh/view counts match before the raycaster's
-                # _obtain_trackable_prim_view sees this expression, so we
-                # know exactly which target trips the
-                # "1 mesh vs N physics" error.
-                _diagnose_target_expr(concrete_expr)
+            bodies = _raycast_body_targets(str(expr))
+            print(f"[raycaster] dynamic target {expr!r}: {len(bodies)} bodies", flush=True)
+            for body_expr in bodies:
                 raycast_targets.append(
                     MultiMeshRayCasterCameraCfg.RaycastTargetCfg(
-                        prim_expr=concrete_expr, track_mesh_transforms=True
+                        prim_expr=body_expr, track_mesh_transforms=True
                     )
                 )
         if not raycast_targets:
@@ -509,11 +451,11 @@ def setup_student_camera(env) -> None:
             )
 
         raycaster_cfg = MultiMeshRayCasterCameraCfg(
-            prim_path="/World/envs/env_.*/StudentCamera",
+            prim_path="/World/envs/env_[^/]+/StudentCamera",
             update_period=float(getattr(cfg, "camera_update_period_s", 0.0)),
             offset=MultiMeshRayCasterCameraCfg.OffsetCfg(
                 pos=tuple(float(x) for x in cfg.camera_pos),
-                rot=tuple(float(x) for x in cfg.camera_quat_wxyz),
+                rot=tuple(float(x) for x in cfg.camera_quat_xyzw),
                 convention=str(cfg.camera_convention),
             ),
             mesh_prim_paths=raycast_targets,
@@ -522,7 +464,7 @@ def setup_student_camera(env) -> None:
             depth_clipping_behavior=str(cfg.raycast_depth_clipping_behavior),
             max_distance=float(cfg.raycast_max_distance_m),
         )
-        env.student_camera = MultiMeshRayCasterCamera(cfg=raycaster_cfg)
+        env.student_camera = _visual_raycaster_camera_cls()(cfg=raycaster_cfg)
         env.scene.sensors["student_camera"] = env.student_camera
         size_str = (
             f"{int(cfg.image_width)}x{int(cfg.image_height)} "
@@ -549,7 +491,7 @@ def setup_student_camera(env) -> None:
             )
 
         left_pos = tuple(float(x) for x in cfg.camera_pos)
-        left_quat = tuple(float(x) for x in cfg.camera_quat_wxyz)
+        left_quat = tuple(float(x) for x in cfg.camera_quat_xyzw)
         right_pos, right_quat = _stereo_right_pose_from_left(
             left_pos, left_quat, float(cfg.fs_stereo_baseline_m)
         )
@@ -581,12 +523,12 @@ def setup_student_camera(env) -> None:
 
         env.student_camera_left = TiledCamera(
             cfg=_build_stereo_cam_cfg(
-                "/World/envs/env_.*/StudentCameraLeft", left_pos, left_quat,
+                "/World/envs/env_[^/]+/StudentCameraLeft", left_pos, left_quat,
             )
         )
         env.student_camera_right = TiledCamera(
             cfg=_build_stereo_cam_cfg(
-                "/World/envs/env_.*/StudentCameraRight", right_pos, right_quat,
+                "/World/envs/env_[^/]+/StudentCameraRight", right_pos, right_quat,
             )
         )
         env.scene.sensors["student_camera_left"] = env.student_camera_left
@@ -788,12 +730,12 @@ def _apply_camera_pose_rand_at_reset(env, env_ids: torch.Tensor) -> None:
     pos_range = torch.as_tensor(cfg.camera_pos_noise_m, device=device, dtype=torch.float32)
     rot_range_deg = torch.as_tensor(cfg.camera_rot_noise_deg, device=device, dtype=torch.float32)
     base_pos = torch.as_tensor(cfg.camera_pos, device=device, dtype=torch.float32)
-    base_quat = torch.as_tensor(cfg.camera_quat_wxyz, device=device, dtype=torch.float32)
+    base_quat = torch.as_tensor(cfg.camera_quat_xyzw, device=device, dtype=torch.float32)
 
     pos_noise = (torch.rand(n, 3, device=device) * 2.0 - 1.0) * pos_range
     rot_noise_rad = (torch.rand(n, 3, device=device) * 2.0 - 1.0) * rot_range_deg * (torch.pi / 180.0)
 
-    # RPY → wxyz quat: q = q_yaw * q_pitch * q_roll
+    # RPY → xyzw quat: q = q_yaw * q_pitch * q_roll
     axes = torch.eye(3, device=device, dtype=torch.float32)
     q_roll = quat_from_angle_axis(rot_noise_rad[:, 0], axes[0].expand(n, -1))
     q_pitch = quat_from_angle_axis(rot_noise_rad[:, 1], axes[1].expand(n, -1))
@@ -803,18 +745,17 @@ def _apply_camera_pose_rand_at_reset(env, env_ids: torch.Tensor) -> None:
     pos_w = env.scene.env_origins[env_ids] + base_pos + pos_noise
     quat = quat_mul(rot_noise_quat, base_quat.expand(n, -1))
 
-    # Isaac Lab 5.1+: when Fabric is enabled, write through to USD so the
-    # renderer actually picks up the new camera pose.
-    view = getattr(camera, "_view", None)
-    if view is not None and hasattr(view, "_sync_usd_on_fabric_write"):
-        view._sync_usd_on_fabric_write = True
-
     camera.set_world_poses(
         positions=pos_w,
         orientations=quat,
         env_ids=env_ids,
         convention=str(cfg.camera_convention),
     )
+
+
+def _as_torch(value):
+    """Sensor outputs are ProxyArrays in Isaac Lab 3; return the torch view."""
+    return value.torch if hasattr(value, "torch") else value
 
 
 def _preprocess_student_depth(env, depth: torch.Tensor) -> torch.Tensor:
@@ -907,8 +848,8 @@ def _run_foundation_stereo(env, cfg) -> torch.Tensor:
             flush=True,
         )
 
-    left_rgba = env.student_camera_left.data.output["rgb"]
-    right_rgba = env.student_camera_right.data.output["rgb"]
+    left_rgba = _as_torch(env.student_camera_left.data.output["rgb"])
+    right_rgba = _as_torch(env.student_camera_right.data.output["rgb"])
     if left_rgba is None or right_rgba is None:
         raise RuntimeError(
             "foundation_stereo backend: one of student_camera_{left,right} "
@@ -1017,7 +958,7 @@ def read_student_camera_image(env) -> torch.Tensor:
     camera.update(dt, force_recompute=False)
 
     outputs = camera.data.output
-    available = {key: value for key, value in outputs.items() if value is not None}
+    available = {key: _as_torch(value) for key, value in outputs.items() if value is not None}
     if not available:
         raise RuntimeError("Student camera produced no outputs.")
 
@@ -1211,12 +1152,10 @@ def _apply_urdf_sdf_collision_markers(
 
     from pxr import Usd, UsdPhysics
 
-    from isaaclab.sim.schemas import SDFMeshPropertiesCfg, define_mesh_collision_properties
+    from isaaclab.sim.schemas import define_mesh_collision_properties
+    from isaaclab_physx.sim.schemas import PhysxSDFMeshPropertiesCfg
 
-    raw_usd_path = Path(usd_path)
-    physics_usd_path = raw_usd_path.parent / "configuration" / f"{raw_usd_path.stem}_physics.usd"
-    edit_usd_path = physics_usd_path if physics_usd_path.exists() else raw_usd_path
-
+    edit_usd_path = Path(usd_path)
     stage = Usd.Stage.Open(str(edit_usd_path), Usd.Stage.LoadAll)
     if stage is None:
         raise RuntimeError(f"Failed to open USD while applying URDF SDF markers: {edit_usd_path}")
@@ -1225,25 +1164,19 @@ def _apply_urdf_sdf_collision_markers(
     marker_by_stem = {marker.mesh_stem: marker for marker in markers}
     matched: dict[str, int] = {marker.mesh_stem: 0 for marker in markers}
 
-    fallback_matches = []
     collider_matches = []
     for prim in Usd.PrimRange(stage.GetPseudoRoot(), Usd.TraverseInstanceProxies()):
         if not prim.HasAPI(UsdPhysics.MeshCollisionAPI):
             continue
-        path = prim.GetPath().pathString
-        path_parts = [part for part in path.split("/") if part]
+        path_parts = [part for part in prim.GetPath().pathString.split("/") if part]
         marker = next((marker_by_stem[part] for part in path_parts if part in marker_by_stem), None)
-        if marker is None:
-            continue
-        if path.startswith("/colliders/"):
+        if marker is not None:
             collider_matches.append((prim, marker))
-        else:
-            fallback_matches.append((prim, marker))
 
-    for prim, marker in collider_matches or fallback_matches:
+    for prim, marker in collider_matches:
         define_mesh_collision_properties(
             str(prim.GetPath()),
-            SDFMeshPropertiesCfg(
+            PhysxSDFMeshPropertiesCfg(
                 sdf_margin=marker.margin,
                 sdf_narrow_band_thickness=marker.narrow_band_thickness,
                 sdf_resolution=marker.resolution,
@@ -1272,7 +1205,7 @@ def _apply_urdf_sdf_collision_markers(
         )
 
 
-def _load_adjacent_links_map() -> dict[str, list[str]]:
+def _load_adjacent_links_map(spec: RobotSpec) -> dict[str, list[str]]:
     """Load the gym-side link adjacency map (the link pairs whose self-collision
     must be filtered) and merge LEFT+RIGHT into one map.
 
@@ -1283,30 +1216,39 @@ def _load_adjacent_links_map() -> dict[str, list[str]]:
     Merging both handednesses is safe: links absent from the imported robot
     (e.g. the right-hand links for a left-hand URDF) simply find no prim and are
     skipped.
+
+    The map is written for the KUKA arm. Its arm links are renamed to the links
+    of ``spec`` (the arm is a serial chain in both cases, and the last arm link
+    carries the merged hand palm), so every arm shares the hand pairs.
     """
     import importlib.util
 
     from isaacgymenvs.utils.utils import get_repo_root_dir
 
     path = get_repo_root_dir() / "isaacgymenvs/tasks/simtoolreal/adjacent_links.py"
-    spec = importlib.util.spec_from_file_location("_simtoolreal_adjacent_links", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    module_spec = importlib.util.spec_from_file_location("_simtoolreal_adjacent_links", path)
+    mod = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(mod)
 
+    from simtoolreal_shared.robots import KUKA_IIWA14
+
+    rename = dict(zip(KUKA_IIWA14.arm_link_names, spec.arm_link_names))
     merged: dict[str, list[str]] = {}
     for src in (
         mod.LEFT_SHARPA_KUKA_LINK_TO_ADJACENT_LINKS,
         mod.RIGHT_SHARPA_KUKA_LINK_TO_ADJACENT_LINKS,
     ):
         for link, neighbors in src.items():
+            link = rename.get(link, link)
             merged.setdefault(link, [])
             for nb in neighbors:
+                nb = rename.get(nb, nb)
                 if nb not in merged[link]:
                     merged[link].append(nb)
     return merged
 
 
-def _apply_self_collision_filters(usd_path: str) -> None:
+def _apply_self_collision_filters(usd_path: str, spec: RobotSpec) -> None:
     """Author USD ``FilteredPairsAPI`` on the robot's articulation links so the
     adjacent-link pairs in ``adjacent_links.py`` do NOT self-collide — mirroring
     Isaac Gym, which enables all self-collisions then masks adjacent links.
@@ -1319,12 +1261,9 @@ def _apply_self_collision_filters(usd_path: str) -> None:
     """
     from pxr import Usd, UsdPhysics
 
-    adjacency = _load_adjacent_links_map()
+    adjacency = _load_adjacent_links_map(spec)
 
-    raw_usd_path = Path(usd_path)
-    physics_usd_path = raw_usd_path.parent / "configuration" / f"{raw_usd_path.stem}_physics.usd"
-    edit_usd_path = physics_usd_path if physics_usd_path.exists() else raw_usd_path
-
+    edit_usd_path = Path(usd_path)
     stage = Usd.Stage.Open(str(edit_usd_path), Usd.Stage.LoadAll)
     if stage is None:
         raise RuntimeError(f"Failed to open USD while applying self-collision filters: {edit_usd_path}")
@@ -1334,6 +1273,14 @@ def _apply_self_collision_filters(usd_path: str) -> None:
     for prim in Usd.PrimRange(stage.GetPseudoRoot(), Usd.TraverseInstanceProxies()):
         if prim.HasAPI(UsdPhysics.RigidBodyAPI):
             body_by_name[prim.GetName()] = prim
+    # Absent links are skipped below, so a name mismatch would silently drop the
+    # palm <-> finger filtering. Fail loudly for the arm instead.
+    missing_arm_links = [name for name in spec.arm_link_names if name not in body_by_name]
+    if missing_arm_links:
+        raise RuntimeError(
+            f"Robot {spec.name!r}: arm links {missing_arm_links} are not rigid bodies in "
+            f"{edit_usd_path.name}; check RobotSpec.arm_link_names against the URDF."
+        )
 
     pairs_filtered = 0
     missing: set[str] = set()
@@ -1418,29 +1365,98 @@ def _generate_scaled_table_urdfs(
     return paths, scales
 
 
+def _replace_collision_cylinders_with_capsules(usd_path: str) -> None:
+    """Turn cylinder colliders into capsules of the same radius and height.
+
+    Isaac Gym and Isaac Sim 5's URDF importer collide URDF cylinders as
+    capsules (the cylinder capped by two hemispheres), and generate_objects.py
+    computes the procedural objects' inertia for that shape. URDF importer 3.0
+    no longer offers ``replace_cylinders_with_capsules``, so author it on the
+    converted asset. Visual cylinders stay cylinders, as before.
+    """
+    from pxr import Usd, UsdGeom, UsdPhysics
+
+    stage = Usd.Stage.Open(usd_path, Usd.Stage.LoadAll)
+    if stage is None:
+        raise RuntimeError(f"Failed to open USD while replacing cylinder colliders: {usd_path}")
+    replaced = 0
+    for prim in Usd.PrimRange(stage.GetPseudoRoot(), Usd.TraverseInstanceProxies()):
+        if not (prim.IsA(UsdGeom.Cylinder) and prim.HasAPI(UsdPhysics.CollisionAPI)):
+            continue
+        if prim.IsInstanceProxy():
+            raise RuntimeError(f"Cylinder collider {prim.GetPath()} is inside an instance; cannot retype it.")
+        radius = UsdGeom.Cylinder(prim).GetRadiusAttr().Get()
+        height = UsdGeom.Cylinder(prim).GetHeightAttr().Get()
+        axis = UsdGeom.Cylinder(prim).GetAxisAttr().Get()
+        # radius/height/axis carry over: Capsule uses the same attribute names,
+        # with height the length of the cylindrical part.
+        prim.SetTypeName("Capsule")
+        capsule = UsdGeom.Capsule(prim)
+        half = [radius, radius, radius]
+        half["XYZ".index(axis)] = 0.5 * height + radius
+        capsule.CreateExtentAttr([tuple(-h for h in half), tuple(half)])
+        replaced += 1
+    if replaced:
+        stage.GetRootLayer().Save()
+
+
+def _patch_urdf_importer_gimbal_lock() -> None:
+    """Fix the URDF importer's fixed-joint merge at pitch = -90 deg.
+
+    Isaac Sim 6.1's ``merge_fixed_joints`` re-expresses merged origins as rpy,
+    and its gimbal-lock branch returns roll + pi when pitch = -pi/2. The Sharpa
+    fingertip pads hang off fixed joints with rpy = (pi/2, -pi/2, 0), so their
+    colliders and visuals ended up mirrored to the back of the fingertips.
+    Replaces the conversion only while the installed one still has the bug.
+    """
+    import math
+
+    import numpy as np
+
+    from isaaclab.sim.utils import enable_extension
+
+    enable_extension("isaacsim.asset.importer.urdf")
+    from isaacsim.asset.importer.urdf.impl import urdf_utils
+
+    def rotation_matrix_to_rpy(R: np.ndarray) -> tuple[float, float, float]:
+        sy = -R[2, 0]
+        if abs(sy) >= 1.0 - 1e-12:
+            # Only roll -/+ yaw is defined; put it all in roll.
+            sign = math.copysign(1.0, sy)
+            return (math.atan2(sign * R[0, 1], sign * R[0, 2]), sign * math.pi / 2, 0.0)
+        return (math.atan2(R[2, 1], R[2, 2]), math.asin(sy), math.atan2(R[1, 0], R[0, 0]))
+
+    rpy = (math.pi / 2, -math.pi / 2, 0.0)
+    R = urdf_utils._rpy_to_rotation_matrix(rpy)
+    if not np.allclose(urdf_utils._rpy_to_rotation_matrix(urdf_utils._rotation_matrix_to_rpy(R)), R, atol=1e-9):
+        urdf_utils._rotation_matrix_to_rpy = rotation_matrix_to_rpy
+
+
 def _convert_urdf_to_usd(
     asset_path: str,
     usd_work_dir: Path,
     *,
     fix_base: bool,
     self_collision: bool | None = None,
-    replace_cylinders_with_capsules: bool = False,
+    cylinders_to_capsules: bool = False,
     joint_drive=None,
 ) -> str:
-    converter_asset_path = _prepare_urdf_for_isaacsim(asset_path, usd_work_dir)
+    _patch_urdf_importer_gimbal_lock()
+    # URDF importer 3.0 silently drops meshes when given a relative URDF path.
+    converter_asset_path = str(Path(_prepare_urdf_for_isaacsim(asset_path, usd_work_dir)).resolve())
     cfg_kwargs = dict(
         asset_path=converter_asset_path,
         usd_dir=str(usd_work_dir / Path(asset_path).stem),
         force_usd_conversion=True,
         fix_base=fix_base,
         merge_fixed_joints=True,
-        make_instanceable=False,
-        replace_cylinders_with_capsules=replace_cylinders_with_capsules,
         joint_drive=joint_drive,
     )
     if self_collision is not None:
         cfg_kwargs["self_collision"] = self_collision
     usd_path = UrdfConverter(UrdfConverterCfg(**cfg_kwargs)).usd_path
+    if cylinders_to_capsules:
+        _replace_collision_cylinders_with_capsules(usd_path)
     _apply_urdf_sdf_collision_markers(
         usd_path,
         converter_asset_path,
@@ -1465,12 +1481,25 @@ def _bake_usd(
     *,
     props: dict | None = None,
     apply_physx_articulation: bool = False,
+    remove_articulation_root: bool = False,
+    fixed_base: bool = False,
     collision_enabled: bool | None = None,
 ) -> str:
     """Copy raw USD into bake_root/baked_subdir and pre-author physics props.
 
     ``props`` keys come from ``_PHYSICS_SPECS``; ``None`` values are skipped,
     and keys whose group doesn't match a prim's APIs are skipped per-prim.
+
+    URDF importer 3.0 puts an articulation root on every asset, single-body
+    ones included; ``remove_articulation_root`` strips it so objects and the
+    table simulate as plain rigid bodies. It also puts the root on the base
+    link, next to the fix-base world joint; PhysX then solves that joint as a
+    maximal-coordinate constraint and the base drifts under contact.
+    ``fixed_base`` moves the root to the asset's root prim, an ancestor of the
+    base link and the world joint, which PhysX treats as a fixed-base
+    articulation (Isaac Sim 5's layout). The importer also writes URDF joint
+    velocity limits only as ``newton:velocityLimit``; they are copied to
+    ``physxJoint:maxJointVelocity`` so PhysX enforces them as in Isaac Sim 5.
     """
     from pxr import PhysxSchema, Sdf, Usd, UsdPhysics
 
@@ -1509,9 +1538,29 @@ def _bake_usd(
         if prim.IsInstance():
             prim.SetInstanceable(False)
 
+    if fixed_base:
+        body_roots = [
+            p for p in Usd.PrimRange(root)
+            if p.HasAPI(UsdPhysics.ArticulationRootAPI) and p.HasAPI(UsdPhysics.RigidBodyAPI)
+        ]
+        if len(body_roots) != 1:
+            raise RuntimeError(f"Expected one articulation root link in {baked_usd_path}, got {body_roots}")
+        body_roots[0].RemoveAPI(UsdPhysics.ArticulationRootAPI)
+        body_roots[0].RemoveAppliedSchema("NewtonArticulationRootAPI")
+        UsdPhysics.ArticulationRootAPI.Apply(root)
+
     for prim in Usd.PrimRange(root):
         is_rb = prim.HasAPI(UsdPhysics.RigidBodyAPI)
         is_art = prim.HasAPI(UsdPhysics.ArticulationRootAPI)
+        if is_art and remove_articulation_root:
+            prim.RemoveAPI(UsdPhysics.ArticulationRootAPI)
+            for schema in ("NewtonArticulationRootAPI", "PhysxArticulationAPI"):
+                prim.RemoveAppliedSchema(schema)
+            is_art = False
+        if prim.IsA(UsdPhysics.Joint):
+            vel_limit = prim.GetAttribute("newton:velocityLimit")
+            if vel_limit and vel_limit.HasValue():
+                PhysxSchema.PhysxJointAPI.Apply(prim).CreateMaxJointVelocityAttr().Set(vel_limit.Get())
         if is_rb:
             PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
         if is_art and apply_physx_articulation:
@@ -1548,11 +1597,13 @@ def apply_physx_material_properties(env) -> None:
 
     Follows Isaac Lab's large-scale randomization path: avoid post-spawn USD
     relationship authoring and per-clone material prims. Must run after
-    ``DirectRLEnv`` starts the simulator and ``root_physx_view`` exists.
+    ``DirectRLEnv`` starts the simulator and the PhysX ``root_view`` exists.
     """
     assets_cfg = env.cfg.assets
     if not assets_cfg.modify_asset_frictions:
         return
+
+    import warp as wp
 
     t0 = time.perf_counter()
     default = torch.tensor(
@@ -1563,7 +1614,8 @@ def apply_physx_material_properties(env) -> None:
         [float(assets_cfg.finger_tip_friction), float(assets_cfg.finger_tip_friction), 0.0],
         dtype=torch.float32, device="cpu",
     )
-    env_ids = torch.arange(env.num_envs, dtype=torch.int64, device="cpu")
+    # The PhysX tensor views take and return warp arrays (CPU for materials).
+    env_ids = wp.from_torch(torch.arange(env.num_envs, dtype=torch.int32, device="cpu"), dtype=wp.int32)
 
     dr = env.cfg.domain_randomization
     n_buckets = int(dr.friction_n_buckets)
@@ -1572,8 +1624,8 @@ def apply_physx_material_properties(env) -> None:
     ft_active = (ft_lo, ft_hi) != (1.0, 1.0)
     obj_active = (obj_lo, obj_hi) != (1.0, 1.0)
 
-    robot_view = env.robot.root_physx_view
-    robot_materials = robot_view.get_material_properties()
+    robot_view = env.robot.root_view
+    robot_materials = wp.to_torch(robot_view.get_material_properties())
     robot_materials[:] = default
 
     fingertip_mask = torch.zeros(robot_view.max_shapes, dtype=torch.bool, device="cpu")
@@ -1604,13 +1656,13 @@ def apply_physx_material_properties(env) -> None:
             robot_materials[:, ft_indices, 0] = per_env_ft.unsqueeze(-1)
             robot_materials[:, ft_indices, 1] = per_env_ft.unsqueeze(-1)
 
-    robot_view.set_material_properties(robot_materials, env_ids)
+    robot_view.set_material_properties(wp.from_torch(robot_materials, dtype=wp.float32), env_ids)
 
     for name in ("table", "object", "goal_viz", "hole"):
         if not hasattr(env, name):
             continue
-        view = getattr(env, name).root_physx_view
-        materials = view.get_material_properties()
+        view = getattr(env, name).root_view
+        materials = wp.to_torch(view.get_material_properties())
         materials[:] = default
         if name == "object" and obj_active:
             obj_base = float(assets_cfg.object_friction)
@@ -1619,7 +1671,7 @@ def apply_physx_material_properties(env) -> None:
             per_env_obj = bucket_vals[bucket_idx]  # (N_envs,)
             materials[:, :, 0] = per_env_obj.unsqueeze(-1)
             materials[:, :, 1] = per_env_obj.unsqueeze(-1)
-        view.set_material_properties(materials, env_ids)
+        view.set_material_properties(wp.from_torch(materials, dtype=wp.float32), env_ids)
 
     _log_scene_step(t0, "applied PhysX material properties")
 
@@ -1635,24 +1687,17 @@ def _materialize_env_prims(env) -> None:
             stage.DefinePrim(env_path, "Xform")
 
 
-def _build_object_scale_tensor(env, object_scales_normalized, num_object_usds: int) -> None:
+def _build_object_scale_tensor(env, object_scales_normalized, asset_index: torch.Tensor) -> None:
     num_envs = env.num_envs
-    object_prim_paths = find_matching_prim_paths("/World/envs/env_.*/Object")
+    object_prim_paths = find_matching_prim_paths("/World/envs/env_[^/]+/Object")
     if len(object_prim_paths) != num_envs:
         raise RuntimeError(
-            f"Expected {num_envs} Object prims after MultiUsdFileCfg spawn, "
-            f"got {len(object_prim_paths)}. Cloner-drop bug may have returned."
+            f"Expected {num_envs} Object prims after spawning, got {len(object_prim_paths)}."
         )
 
-    env._object_scale_per_env = torch.zeros(num_envs, 3, device=env.device, dtype=torch.float32)
-    env._object_asset_index_per_env = torch.zeros(num_envs, device=env.device, dtype=torch.long)
-    for source_idx, obj_path in enumerate(object_prim_paths):
-        env_id = int(obj_path.rsplit("/", 2)[-2].removeprefix("env_"))
-        asset_index = source_idx % num_object_usds
-        env._object_scale_per_env[env_id] = torch.tensor(
-            object_scales_normalized[asset_index], device=env.device, dtype=torch.float32,
-        )
-        env._object_asset_index_per_env[env_id] = asset_index
+    scales = torch.tensor(object_scales_normalized, dtype=torch.float32)
+    env._object_scale_per_env = scales[asset_index].to(env.device)
+    env._object_asset_index_per_env = asset_index.to(env.device, dtype=torch.long)
 
 
 def setup_scene(env) -> None:
@@ -1700,33 +1745,33 @@ def setup_scene(env) -> None:
 
     object_raw_usds = [
         _convert_urdf_to_usd(
-            str(urdf), usd_work_dir, fix_base=False, replace_cylinders_with_capsules=True,
+            str(urdf), usd_work_dir, fix_base=False, cylinders_to_capsules=True,
         )
         for urdf in urdf_paths
     ]
     object_usd_paths = [
         _bake_usd(usd, bake_root, "object", props=dict(
             kinematic_enabled=False, disable_gravity=False,
-            max_depenetration_velocity=1000.0, articulation_enabled=False,
-        ))
+            max_depenetration_velocity=1000.0,
+        ), remove_articulation_root=True)
         for usd in object_raw_usds
     ]
     goalviz_usd_paths = [
         _bake_usd(usd, bake_root, "goalviz", props=dict(
-            kinematic_enabled=True, disable_gravity=True, articulation_enabled=False,
-        ), collision_enabled=False)
+            kinematic_enabled=True, disable_gravity=True,
+        ), remove_articulation_root=True, collision_enabled=False)
         for usd in object_raw_usds
     ]
 
     robot_converted_usd = _convert_urdf_to_usd(
-        assets_cfg.robot_urdf, usd_work_dir,
+        assets_cfg.robot_urdf or env.robot_spec.urdf_path, usd_work_dir,
         fix_base=True, self_collision=True,
         joint_drive=_robot_joint_drive_cfg(),
     )
     # Isaac Gym enables all robot self-collisions then masks adjacent links; mirror
     # that by authoring FilteredPairsAPI for the adjacent_links.py pairs before the
     # bake (PhysX additionally auto-filters directly-jointed parent/child links).
-    _apply_self_collision_filters(robot_converted_usd)
+    _apply_self_collision_filters(robot_converted_usd, env.robot_spec)
     robot_usd_path = _bake_usd(
         robot_converted_usd,
         bake_root, "robot",
@@ -1736,11 +1781,12 @@ def setup_scene(env) -> None:
             solver_position_iterations=8, solver_velocity_iterations=0,
         ),
         apply_physx_articulation=True,
+        fixed_base=True,
     )
     # Table USD(s). When table_scale_range_x/y are non-trivial and
     # table_scale_num_variants > 1, pre-bake N scaled URDF variants and pass
-    # them as a list to RigidObject — Isaac Lab's MultiUsdFileCfg cycles
-    # through the list, giving each env one of the variants. Z scale is held
+    # them as a list to spawn_round_robin_usds, which cycles through the
+    # list, giving each env one of the variants. Z scale is held
     # at 1.0 so the table surface height matches the policy's expectation.
     scale_range_x = tuple(float(v) for v in getattr(assets_cfg, "table_scale_range_x", (1.0, 1.0)))
     scale_range_y = tuple(float(v) for v in getattr(assets_cfg, "table_scale_range_y", (1.0, 1.0)))
@@ -1752,9 +1798,8 @@ def setup_scene(env) -> None:
         table_usd_paths = [_bake_usd(
             _convert_urdf_to_usd(assets_cfg.table_urdf, usd_work_dir, fix_base=False),
             bake_root, "table",
-            props=dict(
-                kinematic_enabled=True, disable_gravity=True, articulation_enabled=False,
-            ),
+            props=dict(kinematic_enabled=True, disable_gravity=True),
+            remove_articulation_root=True,
         )]
         # Single (sx, sy) = (1.0, 1.0) for downstream consumers (eval viz).
         env._table_variant_scales = [(1.0, 1.0)]
@@ -1776,9 +1821,8 @@ def setup_scene(env) -> None:
             _bake_usd(
                 _convert_urdf_to_usd(p, usd_work_dir, fix_base=False),
                 bake_root, f"table_variant_{idx:03d}",
-                props=dict(
-                    kinematic_enabled=True, disable_gravity=True, articulation_enabled=False,
-                ),
+                props=dict(kinematic_enabled=True, disable_gravity=True),
+                remove_articulation_root=True,
             )
             for idx, p in enumerate(variant_urdf_paths)
         ]
@@ -1796,11 +1840,15 @@ def setup_scene(env) -> None:
     # 4. Spawn assets.
     env.robot = Articulation(build_robot_articulation_usd_cfg(
         robot_usd_path,
+        env.robot_spec,
         start_arm_higher=getattr(env.cfg.reset, "start_arm_higher", False),
     ))
-    env.table = RigidObject(build_rigid_object_cfg("/World/envs/env_.*/Table", table_usd_paths))
-    env.object = RigidObject(build_rigid_object_cfg("/World/envs/env_.*/Object", object_usd_paths))
-    env.goal_viz = RigidObject(build_rigid_object_cfg("/World/envs/env_.*/GoalViz", goalviz_usd_paths))
+    spawn_round_robin_usds(env, "Table", table_usd_paths)
+    object_asset_index = spawn_round_robin_usds(env, "Object", object_usd_paths)
+    spawn_round_robin_usds(env, "GoalViz", goalviz_usd_paths)
+    env.table = RigidObject(build_rigid_object_cfg("/World/envs/env_[^/]+/Table"))
+    env.object = RigidObject(build_rigid_object_cfg("/World/envs/env_[^/]+/Object"))
+    env.goal_viz = RigidObject(build_rigid_object_cfg("/World/envs/env_[^/]+/GoalViz"))
     _log_scene_step(setup_t0, "spawned robot/table/object/goalviz")
 
     # 5. Ground plane + dome light (global, outside env_*).
@@ -1809,7 +1857,7 @@ def setup_scene(env) -> None:
     light_cfg.func("/World/Light", light_cfg)
 
     # 6. Per-env scale tensor for spawned Objects.
-    _build_object_scale_tensor(env, object_scales_normalized, len(object_usd_paths))
+    _build_object_scale_tensor(env, object_scales_normalized, object_asset_index)
 
     # 7. Register with scene so DirectRLEnv refreshes their tensors each step.
     env.scene.articulations["robot"] = env.robot

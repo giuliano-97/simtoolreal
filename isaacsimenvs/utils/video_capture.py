@@ -71,7 +71,7 @@ def attach_record_camera(
         ),
         offset=CameraCfg.OffsetCfg(
             pos=(0.0, 0.0, 10.0),
-            rot=(1.0, 0.0, 0.0, 0.0),
+            rot=(0.0, 0.0, 0.0, 1.0),
             convention="opengl",
         ),
     )
@@ -152,6 +152,7 @@ class WandbVideoObserver(AlgoObserver):
             step_dt = float(getattr(self._env, "step_dt", self._env.sim.get_physics_dt()))
             self._camera.update(self._capture_every * step_dt)
             rgb = self._camera.data.output.get("rgb")
+            rgb = rgb.torch if rgb is not None else None
             if rgb is not None and rgb.shape[0] > 0:
                 self._frames.append(rgb[0].detach().cpu().numpy()[:, :, :3])
         except Exception as e:  # don't kill training over a render glitch

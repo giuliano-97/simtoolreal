@@ -96,7 +96,7 @@ def main() -> None:
         ),
         offset=CameraCfg.OffsetCfg(
             pos=(0.0, 0.0, 10.0),  # placeholder
-            rot=(1.0, 0.0, 0.0, 0.0),
+            rot=(0.0, 0.0, 0.0, 1.0),
             convention="opengl",
         ),
     )
@@ -117,8 +117,8 @@ def main() -> None:
     print(f"[diag] env_origin = {env_origin.cpu().tolist()}")
     print(f"[diag] camera eye desired = {eye.cpu().tolist()}")
     print(f"[diag] camera target = {target.cpu().tolist()}")
-    print(f"[diag] camera pos_w actual = {camera.data.pos_w[0].cpu().tolist()}")
-    print(f"[diag] camera quat_w actual = {camera.data.quat_w_world[0].cpu().tolist()}")
+    print(f"[diag] camera pos_w actual = {camera.data.pos_w.torch[0].cpu().tolist()}")
+    print(f"[diag] camera quat_w actual = {camera.data.quat_w_world.torch[0].cpu().tolist()}")
 
     # --- Agent cfg + rl_games wrap ---
     agent_cfg = load_cfg_from_registry(my_args.task, my_args.agent)
@@ -170,7 +170,7 @@ def main() -> None:
 
         if step_i % capture_every == 0:
             camera.update(capture_every * policy_dt)
-            rgb = camera.data.output["rgb"]
+            rgb = camera.data.output["rgb"].torch
             if rgb is not None and rgb.shape[0] > 0:
                 frame = rgb[0].cpu().numpy()[:, :, :3]
                 if not frames:

@@ -26,7 +26,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser()
     AppLauncher.add_app_launcher_args(parser)
-    args = parser.parse_args(["--headless"])
+    args = parser.parse_args([])
     app = AppLauncher(args).app
 
     import gymnasium as gym

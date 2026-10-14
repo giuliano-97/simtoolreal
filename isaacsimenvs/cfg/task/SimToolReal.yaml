@@ -15,7 +15,7 @@ sim:
   dt: 0.00833333333   # 1/120
   render_interval: 2
   gravity: [0.0, 0.0, -9.81]
-  physx:
+  physics:                             # isaaclab_physx PhysxCfg
     solver_type: 1                     # 1 = TGS (matches legacy)
     min_position_iteration_count: 8
     max_position_iteration_count: 8
@@ -32,11 +32,10 @@ sim:
 scene:
   num_envs: 24576
   env_spacing: 1.2
-  # Both must be false for MultiUsdFileCfg to spawn per-env distinct
-  # handle_head USDs: replicate_physics=false makes PhysX parse each env
-  # as its own subtree; clone_in_fabric=false makes the cloner land env
-  # prims in the USD stage (not just Fabric), so the multi-asset
-  # spawner's find_matching_prim_paths sees env_1..env_{N-1}.
+  # Both must be false for per-env distinct handle_head USDs:
+  # replicate_physics=false makes PhysX parse each env as its own subtree;
+  # clone_in_fabric=false keeps env prims in the USD stage (not just
+  # Fabric), where scene_utils.spawn_round_robin_usds authors the assets.
   replicate_physics: false
   clone_in_fabric: false
 
@@ -44,7 +43,9 @@ scene:
 # 3) assets — URDFs, procedural-generation knobs, static per-material frictions
 # -----------------------------------------------------------------------------
 assets:
-  robot_urdf: "assets/urdf/kuka_sharpa_description/iiwa14_left_sharpa_adjusted_restricted.urdf"
+  # Arm + left Sharpa hand: kuka_iiwa14 | flexiv_rizon4 (simtoolreal_shared/robots.py).
+  robot: kuka_iiwa14
+  robot_urdf: ""                      # empty -> the robot spec's URDF
   table_urdf: "assets/urdf/table_narrow.urdf"
 
   object_name: "handle_head_primitives"

@@ -73,7 +73,7 @@ def main() -> None:
     rs.reset_dof_vel_random_interval = 0.0
     rs.table_reset_z_range = 0.0
     rs.fixed_start_pose = (
-        0.0, 0.0, rs.table_reset_z + rs.table_object_z_offset, 1.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, rs.table_reset_z + rs.table_object_z_offset, 0.0, 0.0, 0.0, 1.0,
     )
 
     if args.success_tolerance >= 0:

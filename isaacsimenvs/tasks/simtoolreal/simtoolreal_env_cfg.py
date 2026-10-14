@@ -3,7 +3,7 @@
 Organized into sectioned sub-configclasses that mirror the YAML overlay
 in cfg/task/SimToolReal.yaml 1:1:
 
-    sim                     → isaaclab.sim.SimulationCfg (+ PhysxCfg)
+    sim                     → isaaclab.sim.SimulationCfg (+ isaaclab_physx PhysxCfg)
     scene                   → SimToolRealSceneCfg(InteractiveSceneCfg)
     obs                     → ObsCfg
     student_obs             → StudentObsCfg (disabled by default)
@@ -32,10 +32,12 @@ all DirectRLEnv hooks raise NotImplementedError. Phases B–H populate them.
 
 from __future__ import annotations
 
-from isaaclab.envs import DirectRLEnvCfg, ViewerCfg
+from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sim import PhysxCfg, SimulationCfg
+from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
+from isaaclab.visualizers import VisualizerCfg
+from isaaclab_physx.physics import PhysxCfg
 
 
 # ----------------------------------------------------------------------------
@@ -54,9 +56,12 @@ from isaaclab.utils import configclass
 
 @configclass
 class AssetsCfg:
-    robot_urdf: str = (
-        "assets/urdf/kuka_sharpa_description/iiwa14_left_sharpa_adjusted_restricted.urdf"
-    )
+    # Arm + left Sharpa hand, a key of simtoolreal_shared.robots.ROBOTS
+    # ("kuka_iiwa14" | "flexiv_rizon4"). The spec pins the URDF, joint names,
+    # default poses, arm gains, base pose and palm offset.
+    robot: str = "kuka_iiwa14"
+    # Optional URDF override; empty uses the robot spec's URDF.
+    robot_urdf: str = ""
     table_urdf: str = "assets/urdf/table_narrow.urdf"
     # Per-env scale ranges applied to the table mesh at scene-build time.
     # Sampled independently per env: sx ~ U(table_scale_range_x), sy ~ U(table_scale_range_y).
@@ -194,12 +199,14 @@ class StudentObsCfg:
     camera_mount: str = "world"
     camera_convention: str = "ros"
     camera_pos: tuple[float, float, float] = (0.0, -1.0, 1.0)
-    camera_quat_wxyz: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+    camera_quat_xyzw: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
 
     focal_length: float = 24.0
     horizontal_aperture: float = 33.19737869997174
-    # USD PinholeCamera aperture offsets shift the principal point without
-    # changing FOV or image dimensions.  Defaults are set so the implied
+    # Aperture offsets shift the principal point without changing FOV or image
+    # dimensions. Only the raycaster backend applies them: Omniverse RTX
+    # cameras (tiled / standard) ignore aperture offsets and render with a
+    # centered principal point. Defaults are set so the implied
     # intrinsics match the ZED HD1080 calibration on lab serial 15107
     # (fx=fy=115.67, cx=80.02, cy=47.13 at the 160x90 retrieve resolution).
     # If you ever switch cameras or move to a centered-aperture sensor, set
@@ -220,37 +227,18 @@ class StudentObsCfg:
     camera_update_period_s: float = 0.0
 
     # ---- RayCaster-only knobs (consumed when camera_backend == "raycaster") ----
-    # USD prim-path globs the raycaster casts against. Entries in
-    # `raycast_static_prim_exprs` have their pose cached at sensor init (no
-    # per-step view query, cheaper). Entries in `raycast_dynamic_prim_exprs`
-    # have their mesh transforms refreshed every step — list every prim
-    # whose pose changes (robot links, the peg, the receptive, the table if
-    # table-DR is enabled).
+    # USD prim-path globs the raycaster casts against (visual geometry only).
+    # Entries in `raycast_static_prim_exprs` have their pose cached at sensor
+    # init (no per-step view query, cheaper). Entries in
+    # `raycast_dynamic_prim_exprs` are asset roots whose rigid bodies move:
+    # each body under a root becomes its own tracked target, so articulation
+    # links update per step. Roots missing from the scene are skipped.
     raycast_static_prim_exprs: tuple[str, ...] = ("/World/ground",)
-    # Point at each rigid body's `/visuals` subgroup, NOT the rigid body root.
-    # The URDF importer attaches the visual-origin xform (e.g.
-    # `<origin xyz="0 0 0.38"/>` on a table) at the `/box/visuals` level;
-    # targeting the rigid body root collapses across that xform and the
-    # raycaster places the geometry at z=0 instead. For the iiwa+sharpa
-    # articulation we use `.*` to pick up every link's `/visuals` child —
-    # the MultiMeshRayCaster creates a view that tracks each matched prim's
-    # world pose independently, so articulation joints update per step.
     raycast_dynamic_prim_exprs: tuple[str, ...] = (
-        "/World/envs/env_.*/Table/box/visuals",
-        "/World/envs/env_.*/Hole/hole/visuals",
-        # Wildcard the Object's link-name subpath so this works for any
-        # task / problem URDF (peg, lpeg, fmb_peg_board_*, fabrica beam
-        # parts, furniture parts, ...). The single-link case matches one
-        # `/visuals` group; multi-link URDFs (fabrica) match each link's
-        # `/visuals` group independently, which is what we want.
-        "/World/envs/env_.*/Object/.*/visuals",
-        # iiwa arm + sharpa hand link visuals. Explicit prefixes (not a
-        # broad `/Robot/.*/visuals`) so the parser doesn't try to make
-        # rigid-body views for non-link prims like `/Robot/Looks` /
-        # `/Robot/joints` (those stall sensor init for several minutes
-        # with PhysX retries before timing out).
-        "/World/envs/env_.*/Robot/iiwa14_link_.*/visuals",
-        "/World/envs/env_.*/Robot/left_.*/visuals",
+        "/World/envs/env_[^/]+/Table",
+        "/World/envs/env_[^/]+/Hole",
+        "/World/envs/env_[^/]+/Object",
+        "/World/envs/env_[^/]+/Robot",
     )
     # Rays that don't intersect any mesh return max_distance (instead of NaN)
     # when `depth_clipping_behavior == "max"`. Keep at the rasterizer's default
@@ -260,7 +248,7 @@ class StudentObsCfg:
     raycast_depth_clipping_behavior: str = "none"  # "max" | "zero" | "none"
 
     # ---- Fast-FoundationStereo settings (used when camera_backend == "foundation_stereo") ----
-    # Spawns a stereo TiledCamera pair (left at `camera_pos`/`camera_quat_wxyz`,
+    # Spawns a stereo TiledCamera pair (left at `camera_pos`/`camera_quat_xyzw`,
     # right at left + R_left @ [baseline, 0, 0]), renders RGB at
     # `fs_stereo_width × fs_stereo_height`, runs Fast-FS inference to recover
     # disparity, converts to metric depth, and downsamples to `image_width ×
@@ -363,6 +351,8 @@ class ResetCfg:
     reset_position_noise_x: float = 0.1
     reset_position_noise_y: float = 0.1
     reset_position_noise_z: float = 0.02
+    # Debug / eval: when set, every reset writes this exact env-local object
+    # pose instead of sampling. Format: (x, y, z, qx, qy, qz, qw).
     fixed_start_pose: tuple[float, float, float, float, float, float, float] | None = None
 
     # Joint state noise on reset
@@ -394,14 +384,15 @@ class ResetCfg:
     target_volume_region_scale: float = 1.0
 
     # Debug only — when set, every reset writes this exact env-local pose
-    # to GoalViz instead of sampling. Format: (x, y, z, qw, qx, qy, qz).
+    # to GoalViz instead of sampling. Format: (x, y, z, qx, qy, qz, qw).
     # Used by debug_differences/* to keep both envs visually aligned.
     fixed_goal_pose: tuple[float, float, float, float, float, float, float] | None = None
 
     # Fixed-trajectory ablation: when ``fixed_trajectory_file`` is non-empty,
     # the env ignores ``goal_sampling_type`` and instead draws goal sequences
     # from a pre-generated pool of (N_total, K, 3+4) trajectories in the JSON
-    # file. ``fixed_trajectory_count`` truncates the pool to the first N
+    # file (keys ``pos`` and ``quat_xyzw``; legacy files with ``quat_wxyz`` are
+    # converted on load). ``fixed_trajectory_count`` truncates the pool to the first N
     # (0 = use the whole file). Pair with ``termination.max_consecutive_
     # successes == K`` so episodes end exactly when a trajectory is exhausted.
     #
@@ -518,7 +509,7 @@ def _default_sim_cfg() -> SimulationCfg:
         dt=1.0 / 120.0,
         render_interval=2,
         gravity=(0.0, 0.0, -9.81),
-        physx=PhysxCfg(
+        physics=PhysxCfg(
             solver_type=1,  # 1 = TGS (matches legacy)
             min_position_iteration_count=8,
             max_position_iteration_count=8,
@@ -531,7 +522,15 @@ def _default_sim_cfg() -> SimulationCfg:
             # overflow: "Patch buffer overflow detected" kills training).
             gpu_max_rigid_contact_count=16777216,
             gpu_max_rigid_patch_count=8388608,
+            # Isaac Lab 3 changed the default to True; keep Isaac Lab 2's
+            # once-per-step application of the object wrench DR.
+            enable_external_forces_every_iteration=False,
         ),
+        # Framing for the Kit visualizer, which video recording captures from
+        # (train.py --capture_video). eye/lookat are world-frame; with
+        # replicate_physics=False the central env sits near world origin at
+        # large num_envs, so framing the table/robot here works.
+        default_visualizer_cfg=VisualizerCfg(eye=(0.5, -1.5, 1.2), lookat=(0.0, 0.4, 0.5)),
     )
 
 
@@ -546,7 +545,7 @@ class SimToolRealEnvCfg(DirectRLEnvCfg):
     # --- DirectRLEnvCfg required fields ---
     decimation: int = 2  # 2 physics substeps per policy step
     episode_length_s: float = 10.0  # 600 policy steps * 2 * (1/120) = 10s
-    action_space: int = 29  # 7-DOF IIWA + 22-DOF SHARPA hand
+    action_space: int = 29  # 7-DOF arm + 22-DOF SHARPA hand
     # Obs/state sizes are derived from obs.obs_list / obs.state_list at env init.
     # Placeholder keeps the configclass instantiable before the env computes the
     # final spaces.
@@ -555,31 +554,16 @@ class SimToolRealEnvCfg(DirectRLEnvCfg):
 
     # --- Isaac Lab base fields ---
     sim: SimulationCfg = _default_sim_cfg()
-    # Viewer is the camera DirectRLEnv.render('rgb_array') captures from. One
-    # render product (omni.replicator) is lazily allocated at this prim path
-    # on first render() call — single buffer, num_envs-independent. eye/lookat
-    # are world-frame; with replicate_physics=False the central env sits near
-    # world origin at large num_envs, so framing the table/robot here works.
-    viewer: ViewerCfg = ViewerCfg(
-        eye=(0.5, -1.5, 1.2),
-        lookat=(0.0, 0.4, 0.5),
-        resolution=(640, 480),
-    )
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
         # Validated from-scratch training scale. Smaller counts must stay
         # divisible by the SAPG expl_coef_block_size (4096).
         num_envs=24576,
         env_spacing=1.2,
-        # Per-env distinct USDs (MultiUsdFileCfg) require:
+        # Per-env distinct USDs (scene_utils.spawn_round_robin_usds) require:
         #  - replicate_physics=False so PhysX parses each env as its own
-        #    subtree (otherwise variants collapse into a single template;
-        #    Isaac Lab also emits a hard warning — see
-        #    isaaclab/scene/interactive_scene.py).
-        #  - clone_in_fabric=False so the cloner replicates env_0 into the
-        #    USD stage (not just Fabric). MultiUsdFileCfg's spawner resolves
-        #    the regex prim_path via find_matching_prim_paths, which only
-        #    sees USD prims; with clone_in_fabric=True env_1..env_{N-1}
-        #    exist only in Fabric and the multi-asset spawn lands in env_0.
+        #    subtree (otherwise variants collapse into env_0's template).
+        #  - clone_in_fabric=False so env prims live in the USD stage (not
+        #    just Fabric), where the per-env assets are authored.
         replicate_physics=False,
         clone_in_fabric=False,
     )

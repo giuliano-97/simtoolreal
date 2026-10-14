@@ -6,7 +6,7 @@ import math
 
 import torch
 
-from isaaclab.utils.math import convert_quat, quat_apply, quat_from_angle_axis, quat_mul
+from isaaclab.utils.math import quat_apply, quat_from_angle_axis, quat_mul
 
 
 # ----------------------------------------------------------------------------
@@ -18,8 +18,8 @@ NUM_JOINTS: int = 29
 NUM_FINGERTIPS: int = 5
 NUM_KEYPOINTS: int = 4
 
-# Policy was trained against the palm center, not the raw wrist body.
-PALM_CENTER_OFFSET: tuple[float, float, float] = (-0.0, -0.02, 0.16)
+# The palm center (policy obs, not the raw wrist body) is offset per robot:
+# RobotSpec.palm_center_offset.
 
 # Shift fingertip body origins to the approximate pad centers.
 FINGERTIP_OFFSET: tuple[float, float, float] = (0.02, 0.002, 0.0)
@@ -68,26 +68,27 @@ def _stack_obs_dict(obs_dict: dict[str, torch.Tensor], field_list) -> torch.Tens
 
 
 # ----------------------------------------------------------------------------
-# Quaternion / keypoint helpers
+# Quaternion / keypoint helpers. Quaternions are xyzw throughout: Isaac Lab 3's
+# convention, which is also the legacy Isaac Gym order the policy observes.
 # ----------------------------------------------------------------------------
 
 
-def _perturb_quat(q_wxyz: torch.Tensor, max_deg: float) -> torch.Tensor:
-    """Apply random-axis rotation noise to wxyz quaternions."""
-    n = q_wxyz.shape[0]
+def _perturb_quat(q_xyzw: torch.Tensor, max_deg: float) -> torch.Tensor:
+    """Apply random-axis rotation noise to xyzw quaternions."""
+    n = q_xyzw.shape[0]
     axis = torch.nn.functional.normalize(
-        torch.randn(n, 3, device=q_wxyz.device), dim=-1
+        torch.randn(n, 3, device=q_xyzw.device), dim=-1
     )
-    angle = torch.empty(n, device=q_wxyz.device).uniform_(
+    angle = torch.empty(n, device=q_xyzw.device).uniform_(
         -max_deg, max_deg
     ) * (math.pi / 180.0)
     dq = quat_from_angle_axis(angle, axis)
-    return quat_mul(dq, q_wxyz)
+    return quat_mul(dq, q_xyzw)
 
 
 def _apply_local_offset(
     pos_w: torch.Tensor,
-    rot_wxyz: torch.Tensor,
+    rot_xyzw: torch.Tensor,
     offset: tuple[float, float, float],
     batch_shape: tuple[int, ...],
 ) -> torch.Tensor:
@@ -95,14 +96,14 @@ def _apply_local_offset(
     offset_t = torch.as_tensor(offset, device=pos_w.device, dtype=pos_w.dtype)
     offset_t = offset_t.expand(*batch_shape, 3)
     shifted = quat_apply(
-        rot_wxyz.reshape(-1, 4), offset_t.reshape(-1, 3)
+        rot_xyzw.reshape(-1, 4), offset_t.reshape(-1, 3)
     ).reshape(*batch_shape, 3)
     return pos_w + shifted
 
 
 def _keypoints_world(
     center_pos: torch.Tensor,    # (N, 3)
-    center_rot: torch.Tensor,    # (N, 4) wxyz
+    center_rot: torch.Tensor,    # (N, 4) xyzw
     kp_offsets: torch.Tensor,    # (N, K, 3)
 ) -> torch.Tensor:
     """Rotate + translate object-frame keypoints."""
@@ -136,13 +137,13 @@ def _sample_delay(
 def _canonical_joint_obs(env) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return policy-order joint pos, vel, and previous targets."""
     perm = env._perm_lab_to_canon
-    joint_pos_raw = env.robot.data.joint_pos[:, perm]
+    joint_pos_raw = env.robot.data.joint_pos.torch[:, perm]
     joint_pos = (
         2.0 * (joint_pos_raw - env._joint_lower_canon)
         / (env._joint_upper_canon - env._joint_lower_canon)
         - 1.0
     )
-    return joint_pos, env.robot.data.joint_vel[:, perm], env._prev_targets[:, perm]
+    return joint_pos, env.robot.data.joint_vel.torch[:, perm], env._prev_targets[:, perm]
 
 
 # ----------------------------------------------------------------------------
@@ -158,13 +159,15 @@ def compute_intermediate_values(env) -> None:
     term_cfg = env.cfg.termination
     env_origins = env.scene.env_origins
 
-    obj_pos = env.object.data.root_pos_w - env_origins
-    obj_rot = env.object.data.root_quat_w
-    goal_pos = env.goal_viz.data.root_pos_w - env_origins
-    goal_rot = env.goal_viz.data.root_quat_w
+    obj_pos = env.object.data.root_pos_w.torch - env_origins
+    obj_rot = env.object.data.root_quat_w.torch
+    goal_pos = env.goal_viz.data.root_pos_w.torch - env_origins
+    goal_rot = env.goal_viz.data.root_quat_w.torch
 
-    ft_state = env.robot.data.body_state_w[:, env._fingertip_body_ids, :]
-    ft_pos = ft_state[:, :, 0:3] - env_origins.unsqueeze(1)
+    ft_pos = (
+        env.robot.data.body_link_pos_w.torch[:, env._fingertip_body_ids]
+        - env_origins.unsqueeze(1)
+    )
     env._curr_fingertip_distances = torch.norm(
         ft_pos - obj_pos.unsqueeze(1), dim=-1
     )  # (N, 5)
@@ -235,19 +238,19 @@ def build_observations(env) -> dict[str, torch.Tensor]:
 
     joint_pos, joint_vel, prev_targets_canon = _canonical_joint_obs(env)
 
-    palm_state = env.robot.data.body_state_w[:, env._palm_body_id, :]  # (N, 13)
-    palm_pos_w = palm_state[:, 0:3]
-    palm_rot = palm_state[:, 3:7]  # wxyz (Isaac Lab convention)
-    palm_vel = palm_state[:, 7:13]
+    # Link-frame pose and center-of-mass velocity, as in Isaac Lab 2's body_state_w.
+    body_pose_w = env.robot.data.body_link_pose_w.torch  # (N, B, 7): pos + quat xyzw
+    palm_pos_w = body_pose_w[:, env._palm_body_id, 0:3]
+    palm_rot = body_pose_w[:, env._palm_body_id, 3:7]
+    palm_vel = env.robot.data.body_com_vel_w.torch[:, env._palm_body_id]  # (N, 6)
 
     palm_center_pos_w = _apply_local_offset(
-        palm_pos_w, palm_rot, PALM_CENTER_OFFSET, (env.num_envs,)
+        palm_pos_w, palm_rot, env.robot_spec.palm_center_offset, (env.num_envs,)
     )
     palm_pos = palm_center_pos_w - env_origins
 
-    ft_state = env.robot.data.body_state_w[:, env._fingertip_body_ids, :]  # (N, 5, 13)
-    ft_body_pos_w = ft_state[:, :, 0:3]
-    ft_body_rot_w = ft_state[:, :, 3:7]  # wxyz
+    ft_body_pos_w = body_pose_w[:, env._fingertip_body_ids, 0:3]  # (N, 5, 3)
+    ft_body_rot_w = body_pose_w[:, env._fingertip_body_ids, 3:7]
 
     ft_pos_w = _apply_local_offset(
         ft_body_pos_w,
@@ -256,14 +259,14 @@ def build_observations(env) -> dict[str, torch.Tensor]:
         (env.num_envs, NUM_FINGERTIPS),
     )
 
-    obj_pos = env.object.data.root_pos_w - env_origins
-    obj_rot = env.object.data.root_quat_w  # wxyz
-    obj_linvel = env.object.data.root_lin_vel_w
-    obj_angvel = env.object.data.root_ang_vel_w
+    obj_pos = env.object.data.root_pos_w.torch - env_origins
+    obj_rot = env.object.data.root_quat_w.torch
+    obj_linvel = env.object.data.root_lin_vel_w.torch
+    obj_angvel = env.object.data.root_ang_vel_w.torch
     obj_vel = torch.cat([obj_linvel, obj_angvel], dim=-1)
 
-    goal_pos = env.goal_viz.data.root_pos_w - env_origins
-    goal_rot = env.goal_viz.data.root_quat_w  # wxyz
+    goal_pos = env.goal_viz.data.root_pos_w.torch - env_origins
+    goal_rot = env.goal_viz.data.root_quat_w.torch
 
     if dr.use_object_state_delay_noise:
         noisy_obj_pos, noisy_obj_rot, noisy_obj_vel = _apply_object_state_dr(
@@ -300,19 +303,14 @@ def build_observations(env) -> dict[str, torch.Tensor]:
 
     object_scales_obs = env._object_scale_per_env * env._object_scale_multiplier
 
-    # Policy obs use legacy Isaac Gym xyzw; internal math stays wxyz.
-    palm_rot_xyzw = convert_quat(palm_rot, to="xyzw")
-    obj_rot_xyzw = convert_quat(obj_rot, to="xyzw")
-    noisy_obj_rot_xyzw = convert_quat(noisy_obj_rot, to="xyzw")
-
     obs_clean: dict[str, torch.Tensor] = {
         "joint_pos": joint_pos,
         "joint_vel": joint_vel,
         "prev_action_targets": prev_targets_canon,
         "palm_pos": palm_pos,
-        "palm_rot": palm_rot_xyzw,
+        "palm_rot": palm_rot,
         "palm_vel": palm_vel,
-        "object_rot": obj_rot_xyzw,
+        "object_rot": obj_rot,
         "object_vel": obj_vel,
         "fingertip_pos_rel_palm": fingertip_pos_rel_palm,
         "keypoints_rel_palm": keypoints_rel_palm_clean,
@@ -327,7 +325,7 @@ def build_observations(env) -> dict[str, torch.Tensor]:
     }
 
     obs_noisy = dict(obs_clean)
-    obs_noisy["object_rot"] = noisy_obj_rot_xyzw
+    obs_noisy["object_rot"] = noisy_obj_rot
     obs_noisy["object_vel"] = noisy_obj_vel
     obs_noisy["keypoints_rel_palm"] = keypoints_rel_palm_noisy
     obs_noisy["keypoints_rel_goal"] = keypoints_rel_goal_noisy

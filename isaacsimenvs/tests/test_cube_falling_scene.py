@@ -84,7 +84,7 @@ def main():
             ),
             offset=CameraCfg.OffsetCfg(
                 pos=(0.0, -1.5, 0.8),
-                rot=(0.8507, 0.5257, 0.0, 0.0),
+                rot=(0.5257, 0.0, 0.0, 0.8507),
                 convention="opengl",
             ),
         )
@@ -100,11 +100,11 @@ def main():
         cube.update(dt)
         if camera is not None and step_i % capture_every == 0:
             camera.update(capture_every * dt)
-            rgb = camera.data.output["rgb"]
+            rgb = camera.data.output["rgb"].torch
             if rgb is not None and rgb.shape[0] > 0:
                 frames.append(rgb[0].cpu().numpy()[:, :, :3])
 
-    final_z = cube.data.root_pos_w[0, 2].item()
+    final_z = cube.data.root_pos_w.torch[0, 2].item()
     print(f"Cube final z: {final_z:.4f} (started at {START_Z}, expected ~{CUBE_SIZE / 2:.2f})")
     assert abs(final_z - (CUBE_SIZE / 2)) < 0.0001, f"Cube did not land (final_z={final_z})"
 

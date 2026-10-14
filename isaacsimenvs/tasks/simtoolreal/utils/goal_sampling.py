@@ -35,7 +35,7 @@ def sample_absolute_goal_pose(
 
 def sample_delta_goal_pose(
     prev_pos: torch.Tensor,              # (N, 3)
-    prev_quat_wxyz: torch.Tensor,         # (N, 4)
+    prev_quat_xyzw: torch.Tensor,         # (N, 4)
     delta_distance: float,
     delta_rotation_degrees: float,
     mins: tuple[float, float, float],
@@ -58,7 +58,7 @@ def sample_delta_goal_pose(
         math.pi / 180.0
     )
     dq = quat_from_angle_axis(angle, axis)
-    new_quat = quat_mul(dq, prev_quat_wxyz)
+    new_quat = quat_mul(dq, prev_quat_xyzw)
     return new_pos, new_quat
 
 

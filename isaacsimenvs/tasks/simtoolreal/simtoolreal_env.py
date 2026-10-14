@@ -10,6 +10,8 @@ import torch
 
 from isaaclab.envs import DirectRLEnv
 
+from simtoolreal_shared.robots import get_robot_spec
+
 from .simtoolreal_env_cfg import SimToolRealEnvCfg
 from .utils.action_utils import apply_action_pipeline, apply_wrench_dr
 from .utils.logging_utils import log_step_metrics
@@ -38,6 +40,7 @@ class SimToolRealEnv(DirectRLEnv):
         # DirectRLEnv / rl_games observes the configclass.
         cfg.observation_space = compute_obs_dim(cfg.obs.obs_list)
         cfg.state_space = compute_obs_dim(cfg.obs.state_list)
+        self.robot_spec = get_robot_spec(cfg.assets.robot)
 
         super().__init__(cfg, render_mode, **kwargs)  # runs _setup_scene
         apply_physx_material_properties(self)
@@ -61,7 +64,7 @@ class SimToolRealEnv(DirectRLEnv):
 
     def _apply_action(self) -> None:
         # Called decimation times per policy step; idempotent.
-        self.robot.set_joint_position_target(self._cur_targets)
+        self.robot.actuators.target_command.set_position_index(value=self._cur_targets)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         update_tolerance_curriculum(self)

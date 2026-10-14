@@ -47,24 +47,28 @@ def apply_action_pipeline(env, actions: torch.Tensor) -> None:
             torch.arange(env.num_envs, device=env.device), delay_idx
         ]
 
+    # Actions and targets are in Lab order here; select arm/hand by joint id
+    # (not by position) so the split holds for any URDF joint ordering.
+    arm_ids, hand_ids = env._arm_joint_ids, env._hand_joint_ids
+
     # Arm: velocity-delta accumulator.
-    arm_action = actions[:, :7]
-    arm_raw = env._prev_targets[:, :7] + act_cfg.dof_speed_scale * dt * arm_action
+    arm_action = actions[:, arm_ids]
+    arm_raw = env._prev_targets[:, arm_ids] + act_cfg.dof_speed_scale * dt * arm_action
     arm_raw = torch.clamp(arm_raw, env._arm_lower, env._arm_upper)
     arm_smoothed = (
         act_cfg.arm_moving_average * arm_raw
-        + (1.0 - act_cfg.arm_moving_average) * env._prev_targets[:, :7]
+        + (1.0 - act_cfg.arm_moving_average) * env._prev_targets[:, arm_ids]
     )
     arm_smoothed = torch.clamp(arm_smoothed, env._arm_lower, env._arm_upper)
 
     # Hand: absolute [-1, 1] scale.
-    hand_action = actions[:, 7:]
+    hand_action = actions[:, hand_ids]
     hand_raw = env._hand_lower + 0.5 * (hand_action + 1.0) * (
         env._hand_upper - env._hand_lower
     )
     hand_smoothed = (
         act_cfg.hand_moving_average * hand_raw
-        + (1.0 - act_cfg.hand_moving_average) * env._prev_targets[:, 7:]
+        + (1.0 - act_cfg.hand_moving_average) * env._prev_targets[:, hand_ids]
     )
     hand_smoothed = torch.clamp(hand_smoothed, env._hand_lower, env._hand_upper)
 
@@ -123,7 +127,8 @@ def apply_wrench_dr(env) -> None:
             env._object_forces *= active_f
             env._object_torques *= active_f
 
-    env.object.set_external_force_and_torque(
+    # Replaces the previous step's wrench (Isaac Lab 2's set_external_force_and_torque).
+    env.object.permanent_wrench_composer.set_forces_and_torques_index(
         forces=env._object_forces,
         torques=env._object_torques,
         is_global=True,

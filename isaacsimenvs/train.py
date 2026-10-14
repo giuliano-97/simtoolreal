@@ -18,7 +18,7 @@ CLI shape:
     python isaacsimenvs/train.py \
         --task Isaacsimenvs-SimToolReal-Direct-v0 \
         --agent rl_games_sapg_cfg_entry_point \   # or rl_games_cfg_entry_point
-        --headless --capture_viewer \
+        --capture_viewer \
         --wandb_activate --wandb_project X --wandb_name Y \
         env.scene.num_envs=4096 \
         agent.params.config.max_epochs=200 \
@@ -58,9 +58,15 @@ def main() -> None:
     parser.add_argument("--rl_device", default="cuda:0")
     parser.add_argument("--sim_device", default="cuda:0")
     # --- Video ---
-    parser.add_argument("--capture_video", action="store_true", help="Attach recording camera; implies --enable_cameras")
-    parser.add_argument("--video_interval", type=int, default=10)
-    parser.add_argument("--video_capture_frames", type=int, default=120)
+    parser.add_argument(
+        "--capture_video",
+        action="store_true",
+        help="Record mp4 clips from a headless Kit viewport; implies --enable_cameras",
+    )
+    parser.add_argument(
+        "--video_interval", type=int, default=1000, help="Env steps between clip starts (>= --video_capture_frames)"
+    )
+    parser.add_argument("--video_capture_frames", type=int, default=120, help="Env steps per clip")
     parser.add_argument("--video_fps", type=int, default=30)
     # --- Pose-only interactive HTML viewer (no cameras / no renderer) ---
     parser.add_argument(
@@ -92,13 +98,24 @@ def main() -> None:
     parser.add_argument("--wandb_tags", nargs="*", default=[])
     parser.add_argument("--wandb_notes", default="")
     parser.add_argument("--wandb_logcode_dir", default="")
-    # --- AppLauncher flags (--headless, --enable_cameras, etc.) ---
+    # --- AppLauncher flags (--viz, --device, --kit_args, etc.) ---
     AppLauncher.add_app_launcher_args(parser)
+    # Isaac Lab 3 runs headless unless a visualizer is selected (--viz kit), and
+    # its AppLauncher dropped the --enable_cameras flag while still reading the
+    # option, which camera sensors need. It must be added after the AppLauncher
+    # args, which reject parsers that already define their options.
+    parser.add_argument(
+        "--enable_cameras", action="store_true", help="Render camera sensors (student cameras, video)."
+    )
     args_cli, hydra_args = parser.parse_known_args()
 
     # Recording a video requires cameras even if user forgot --enable_cameras.
     if args_cli.capture_video:
         args_cli.enable_cameras = True
+        # Isaac Lab's recorder starts a new clip on every interval, cutting the
+        # current one short.
+        if args_cli.video_interval < args_cli.video_capture_frames:
+            parser.error("--video_interval must be >= --video_capture_frames")
 
     # Hand the leftover key=value tokens to Hydra via sys.argv.
     sys.argv = [sys.argv[0]] + hydra_args
@@ -130,31 +147,29 @@ def main() -> None:
         # seed. Previously only rl_games saw the agent seed override.
         env_cfg.seed = int(agent_cfg["params"]["seed"])
 
-        # render_mode="rgb_array" makes DirectRLEnv.render() lazily create a
-        # single omni.replicator render_product at cfg.viewer.cam_prim_path —
-        # one buffer, num_envs-independent. The custom attach_record_camera
-        # path we used before created a Camera sensor and called sim.reset()
-        # *after* env init, which momentarily doubled the PhysX scene state
-        # (~400 GB at 24576 envs) and OOM'd the slurm cgroup. The Lab-
-        # canonical pattern is render_mode + gym.wrappers.RecordVideo (see
-        # IsaacLab tests/test_record_video.py).
-        env = gym.make(
-            args_cli.task,
-            cfg=env_cfg,
-            render_mode="rgb_array" if args_cli.capture_video else None,
-        )
-
         if args_cli.capture_video:
+            # Isaac Lab 3 records inside the env from a visualizer: one headless
+            # Kit viewport (a single render product, num_envs-independent) framed
+            # by env_cfg.sim.default_visualizer_cfg. A Camera sensor added after
+            # env init would need another sim.reset(), which momentarily doubles
+            # the PhysX scene state (~400 GB at 24576 envs).
             from pathlib import Path
 
-            video_folder = str(Path(hydra_run_dir) / "videos")
-            env = gym.wrappers.RecordVideo(
-                env,
-                video_folder=video_folder,
-                step_trigger=lambda step: step % args_cli.video_interval == 0,
-                video_length=args_cli.video_capture_frames,
-                disable_logger=True,
-            )
+            from isaaclab.envs.utils.video_recorder_cfg import VideoRecorderCfg
+            from isaaclab_visualizers.kit import KitVisualizerCfg
+
+            env_cfg.sim.visualizer_cfgs = [KitVisualizerCfg(headless=True, window_width=640, window_height=480)]
+            env_cfg.video_recorders = [
+                VideoRecorderCfg(
+                    source="visualizer:kit",
+                    output_dir=str(Path(hydra_run_dir) / "videos"),
+                    fps=args_cli.video_fps,
+                    video_length=args_cli.video_capture_frames,
+                    video_interval=args_cli.video_interval,
+                )
+            ]
+
+        env = gym.make(args_cli.task, cfg=env_cfg)
 
         if args_cli.capture_viewer:
             from pathlib import Path

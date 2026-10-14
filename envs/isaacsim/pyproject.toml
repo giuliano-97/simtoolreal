@@ -1,4 +1,4 @@
-# Isaac Sim (Isaac Lab) environment for SimToolReal — Python 3.11, separate from the
+# Isaac Sim (Isaac Lab) environment for SimToolReal — Python 3.12, separate from the
 # Python 3.8 Isaac Gym environment defined by the root pyproject.toml.
 #
 # Install / update (from the repo root):
@@ -15,15 +15,16 @@ build-backend = "setuptools.build_meta"
 name = "simtoolreal-isaacsim"
 version = "0.1.0"
 description = "Isaac Sim / Isaac Lab environment for SimToolReal"
-requires-python = "==3.11.*"
+requires-python = "==3.12.*"
 dependencies = [
-    # PyTorch for CUDA 12.6 (Isaac Sim 5.1 pins these exact versions)
-    "torch==2.7.0",
-    "torchvision==0.22.0",
-    "torchaudio==2.7.0",
-    # Isaac Lab + Isaac Sim. Keep the pin exact: newer Isaac Lab releases change the
-    # DirectRLEnv / UrdfConverter APIs that isaacsimenvs depends on.
-    "isaaclab[isaacsim,all]==2.3.2.post1",
+    # PyTorch for CUDA 12.8 (Isaac Lab 3.0 is built against PyTorch 2.11)
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "torchaudio==2.11.0",
+    # Isaac Lab 3.0 Early Access (published as 3.0.0rc1) + Isaac Sim 6.1. Isaac Sim 5.x
+    # renderers crash on current NVIDIA drivers, so cameras need this stack. Keep the pin
+    # exact until Isaac Lab 3.0 GA: prereleases still change the APIs isaacsimenvs uses.
+    "isaaclab[isaacsim,video]==3.0.0rc1",
     # Vendored rl_games + inference deps
     "rl-games",
     "omegaconf",
@@ -69,19 +70,25 @@ simtoolreal_shared = "../../simtoolreal_shared"
 [tool.uv]
 # Isaac Sim only ships Linux x86_64 wheels for this setup; don't lock for other platforms.
 environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
-# isaacsim-kernel pins typing_extensions==4.12.2, but tyro.cli needs NoExtraItems from
-# typing_extensions>=4.13. Newer typing_extensions works with isaaclab 2.3.2.post1.
+# Isaac Sim 6 depends on packages published on both pypi.nvidia.com and PyPI at different
+# versions (e.g. mujoco-usd-converter), so consider every index for each package.
+index-strategy = "unsafe-best-match"
+# isaaclab 3.0.0rc1 and transitive Isaac Sim 6 pins (e.g. tinyobjloader rc builds) are
+# prereleases, which uv only accepts with prereleases allowed globally.
+prerelease = "allow"
+# isaaclab pins typing_extensions==4.12.2, but tyro.cli needs NoExtraItems from
+# typing_extensions>=4.13.
 override-dependencies = ["typing-extensions>=4.13"]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu126" }
-torchvision = { index = "pytorch-cu126" }
-torchaudio = { index = "pytorch-cu126" }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
 rl-games = { path = "../../rl_games", editable = true }
 
 [[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [[tool.uv.index]]

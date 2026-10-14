@@ -21,6 +21,7 @@ def main() -> None:
     parser.add_argument("--num_envs", type=int, default=8)
     parser.add_argument("--num_assets_per_type", type=int, default=2)
     parser.add_argument("--steps", type=int, default=5)
+    parser.add_argument("--robot", default="kuka_iiwa14", help="simtoolreal_shared.robots key")
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
     args.headless = True
@@ -38,12 +39,13 @@ def main() -> None:
     cfg = SimToolRealEnvCfg()
     cfg.scene.num_envs = args.num_envs
     cfg.assets.num_assets_per_type = args.num_assets_per_type
+    cfg.assets.robot = args.robot
 
     env = gym.make("Isaacsimenvs-SimToolReal-Direct-v0", cfg=cfg)
     inner = env.unwrapped
 
-    object_prims = find_matching_prim_paths("/World/envs/env_.*/Object")
-    goal_prims = find_matching_prim_paths("/World/envs/env_.*/GoalViz")
+    object_prims = find_matching_prim_paths("/World/envs/env_[^/]+/Object")
+    goal_prims = find_matching_prim_paths("/World/envs/env_[^/]+/GoalViz")
     assert len(object_prims) == args.num_envs, (
         f"Object prims: {len(object_prims)}, expected {args.num_envs}"
     )
@@ -56,20 +58,20 @@ def main() -> None:
 
     # Diagnostic: all PhysX joint params that could dampen response —
     # stiffness, damping, armature (virtual inertia), friction, effort limit.
-    from isaacsimenvs.tasks.simtoolreal.utils.scene_utils import JOINT_NAMES_CANONICAL
-    stiffness = inner.robot.data.joint_stiffness[0].cpu().numpy()
-    damping = inner.robot.data.joint_damping[0].cpu().numpy()
-    armature = inner.robot.data.joint_armature[0].cpu().numpy()
-    friction = inner.robot.data.joint_friction_coeff[0].cpu().numpy()
-    effort_lim = inner.robot.data.joint_effort_limits[0].cpu().numpy()
+    joint_names_canonical = inner.robot_spec.joint_names_canonical
+    stiffness = inner.robot.data.joint_stiffness.torch[0].cpu().numpy()
+    damping = inner.robot.data.joint_damping.torch[0].cpu().numpy()
+    armature = inner.robot.data.joint_armature.torch[0].cpu().numpy()
+    friction = inner.robot.data.joint_friction_coeff.torch[0].cpu().numpy()
+    effort_lim = inner.robot.data.joint_effort_limits.torch[0].cpu().numpy()
     perm = inner._perm_lab_to_canon.cpu().numpy()
     # Dump per-link masses / inertias Isaac Lab sees from the URDF.
     # URDF declares thumb chain masses around 1e-3 kg per link — if
     # PhysX 5 shows e.g. 1 kg per link we've found the inertia inflation
     # that explains the 100x slow PD response.
-    masses = inner.robot.data.default_mass[0].cpu().numpy()  # (num_bodies,)
-    inertias = inner.robot.data.default_inertia[0].cpu().numpy()  # (num_bodies, 9) or similar
-    body_names = inner.robot.data.body_names
+    masses = inner.robot.data.body_mass.torch[0].cpu().numpy()  # (num_bodies,)
+    inertias = inner.robot.data.body_inertia.torch[0].cpu().numpy()  # (num_bodies, 9)
+    body_names = inner.robot.body_names
     print(f"[smoke] Body masses / inertias (all {len(body_names)} bodies):")
     print(f"  {'idx':>3}  {'name':<25s}  {'mass (kg)':>10s}  {'Ixx':>10s}  {'Iyy':>10s}  {'Izz':>10s}")
     for i, name in enumerate(body_names):
@@ -83,7 +85,7 @@ def main() -> None:
     for i in range(29):
         lab_j = perm[i]
         print(
-            f"  [{i:2d}] {JOINT_NAMES_CANONICAL[i]:<22s}  "
+            f"  [{i:2d}] {joint_names_canonical[i]:<22s}  "
             f"{stiffness[lab_j]:>8.4f}  {damping[lab_j]:>8.4f}  "
             f"{armature[lab_j]:>8.5f}  {friction[lab_j]:>8.5f}  {effort_lim[lab_j]:>8.4f}"
         )

@@ -12,13 +12,7 @@ from isaaclab.utils.math import random_orientation
 from .action_utils import sample_log_uniform
 from .goal_sampling import sample_absolute_goal_pose, sample_delta_goal_pose
 from .obs_utils import KEYPOINT_CORNERS, NUM_FINGERTIPS
-from .scene_utils import (
-    ARM_JOINT_REGEX,
-    FINGERTIP_BODY_REGEX,
-    HAND_JOINT_REGEX,
-    JOINT_NAMES_CANONICAL,
-    PALM_BODY_NAME,
-)
+from .scene_utils import FINGERTIP_BODY_REGEX, HAND_JOINT_REGEX
 
 def allocate_state_buffers(env) -> None:
     """Populate every per-env buffer + index cache used by the hooks.
@@ -31,25 +25,30 @@ def allocate_state_buffers(env) -> None:
     rew = env.cfg.reward
 
     # --- Joint/body id caches ---
-    env._arm_joint_ids = env.robot.find_joints(ARM_JOINT_REGEX)[0]      # 7
+    spec = env.robot_spec
+    env._arm_joint_ids = env.robot.find_joints(list(spec.arm_joint_names))[0]  # 7
     env._hand_joint_ids = env.robot.find_joints(HAND_JOINT_REGEX)[0]     # 22
-    env._palm_body_id = env.robot.find_bodies(PALM_BODY_NAME)[0][0]
+    env._palm_body_id = env.robot.find_bodies(spec.palm_body_name)[0][0]
     env._fingertip_body_ids = env.robot.find_bodies(FINGERTIP_BODY_REGEX)[0]  # 5
     assert len(env._fingertip_body_ids) == NUM_FINGERTIPS
 
     # Convert between Lab parser order and canonical policy order.
-    lab_names = list(env.robot.data.joint_names)
-    assert set(lab_names) == set(JOINT_NAMES_CANONICAL)
+    canonical = spec.joint_names_canonical
+    lab_names = list(env.robot.joint_names)
+    assert set(lab_names) == set(canonical), (
+        f"robot {spec.name!r}: URDF joints {sorted(set(lab_names) ^ set(canonical))} "
+        "differ from the RobotSpec"
+    )
     env._perm_canon_to_lab = torch.tensor(
-        [JOINT_NAMES_CANONICAL.index(n) for n in lab_names],
+        [canonical.index(n) for n in lab_names],
         device=env.device, dtype=torch.long,
     )
     env._perm_lab_to_canon = torch.tensor(
-        [lab_names.index(n) for n in JOINT_NAMES_CANONICAL],
+        [lab_names.index(n) for n in canonical],
         device=env.device, dtype=torch.long,
     )
 
-    limits = env.robot.data.joint_pos_limits  # (N, num_joints, 2), Lab order
+    limits = env.robot.data.joint_pos_limits.torch.clone()  # (N, num_joints, 2), Lab order
 
     # Canonical-order limits for normalizing joint_pos observations.
     env._joint_lower_canon = limits[0, :, 0][env._perm_lab_to_canon]  # (29,)
@@ -158,7 +157,7 @@ def allocate_state_buffers(env) -> None:
     ).to(env.device)
     env._object_forces = torch.zeros(env.num_envs, 1, 3, device=env.device)
     env._object_torques = torch.zeros(env.num_envs, 1, 3, device=env.device)
-    env._object_mass = env.object.data.default_mass[:, 0:1].to(env.device)  # (N, 1)
+    env._object_mass = env.object.data.body_mass.torch[:, 0:1].clone().to(env.device)  # (N, 1)
 
     # --- Step-shared caches populated by compute_intermediate_values (Phase F) ---
     env._keypoints_max_dist = torch.zeros(env.num_envs, device=env.device)
@@ -181,7 +180,11 @@ def allocate_state_buffers(env) -> None:
         with open(path) as f:
             payload = json.load(f)
         all_pos = torch.tensor(payload["pos"], device=env.device, dtype=torch.float32)
-        all_quat = torch.tensor(payload["quat_wxyz"], device=env.device, dtype=torch.float32)
+        if "quat_xyzw" in payload:
+            all_quat = torch.tensor(payload["quat_xyzw"], device=env.device, dtype=torch.float32)
+        else:  # files written for Isaac Lab 2 store wxyz
+            all_quat = torch.tensor(payload["quat_wxyz"], device=env.device, dtype=torch.float32)
+            all_quat = all_quat[..., [1, 2, 3, 0]]
         n_total = all_pos.shape[0]
         n_take = env.cfg.reset.fixed_trajectory_count or n_total
         if n_take > n_total:
@@ -200,9 +203,10 @@ def allocate_state_buffers(env) -> None:
 def _randomize_robot_dof_state(env, env_ids: torch.Tensor) -> None:
     """Reset DOF state and seed previous targets from the reset pose."""
     cfg = env.cfg.reset
-    default_pos = env.robot.data.default_joint_pos[env_ids]  # (n, num_dofs)
-    lower = env.robot.data.joint_pos_limits[env_ids, :, 0]
-    upper = env.robot.data.joint_pos_limits[env_ids, :, 1]
+    default_pos = env.robot.data.default_joint_pos.torch[env_ids]  # (n, num_dofs)
+    limits = env.robot.data.joint_pos_limits.torch[env_ids]
+    lower = limits[:, :, 0]
+    upper = limits[:, :, 1]
 
     reset_scale = torch.zeros_like(default_pos)
     reset_scale[:, env._arm_joint_ids] = cfg.reset_dof_pos_random_interval_arm
@@ -215,7 +219,8 @@ def _randomize_robot_dof_state(env, env_ids: torch.Tensor) -> None:
         cfg.reset_dof_vel_random_interval,
     )
 
-    env.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+    env.robot.write_joint_position_to_sim_index(position=joint_pos, env_ids=env_ids)
+    env.robot.write_joint_velocity_to_sim_index(velocity=joint_vel, env_ids=env_ids)
     env._prev_targets[env_ids] = joint_pos
     env._cur_targets[env_ids] = joint_pos
 
@@ -249,7 +254,7 @@ def _reset_table_pose(env, env_ids: torch.Tensor) -> None:
         pos_local[:, 0] = rx
         pos_local[:, 1] = ry
 
-    # Yaw noise — sample uniform [-r, r] degrees, build a z-axis rotation quat.
+    # Yaw noise — sample uniform [-r, r] degrees, build a z-axis rotation quat (xyzw).
     yaw_range_deg = float(cfg.table_reset_yaw_range_deg)
     if yaw_range_deg > 0.0:
         yaw_rad = (
@@ -259,14 +264,14 @@ def _reset_table_pose(env, env_ids: torch.Tensor) -> None:
         half = yaw_rad * 0.5
         w = torch.cos(half)
         z = torch.sin(half)
-        quat = torch.stack([w, torch.zeros_like(w), torch.zeros_like(w), z], dim=-1)
+        quat = torch.stack([torch.zeros_like(w), torch.zeros_like(w), z, w], dim=-1)
     else:
         quat = torch.tensor(
-            [1.0, 0.0, 0.0, 0.0], device=env.device, dtype=torch.float32
+            [0.0, 0.0, 0.0, 1.0], device=env.device, dtype=torch.float32
         ).unsqueeze(0).expand(n, -1)
 
     pose = torch.cat([pos_local + env_origins, quat], dim=-1)
-    env.table.write_root_pose_to_sim(pose, env_ids=env_ids)
+    env.table.write_root_pose_to_sim_index(root_pose=pose, env_ids=env_ids)
 
 def _reset_object_pose(env, env_ids: torch.Tensor) -> None:
     """Reset object pose and lifted-reward reference height."""
@@ -293,9 +298,9 @@ def _reset_object_pose(env, env_ids: torch.Tensor) -> None:
         quat = random_orientation(n, device=env.device)
 
     pose = torch.cat([pos_local + env_origins, quat], dim=-1)
-    env.object.write_root_pose_to_sim(pose, env_ids=env_ids)
-    env.object.write_root_velocity_to_sim(
-        torch.zeros(n, 6, device=env.device), env_ids=env_ids
+    env.object.write_root_pose_to_sim_index(root_pose=pose, env_ids=env_ids)
+    env.object.write_root_velocity_to_sim_index(
+        root_velocity=torch.zeros(n, 6, device=env.device), env_ids=env_ids
     )
 
     env._object_init_z[env_ids] = pos_local[:, 2]
@@ -312,7 +317,7 @@ def _reset_goal_pose(env, env_ids: torch.Tensor, mode: str) -> None:
         new_pos_local = fixed[:3].unsqueeze(0).expand(n, -1)
         new_quat = fixed[3:].unsqueeze(0).expand(n, -1)
         pose = torch.cat([new_pos_local + env_origins, new_quat], dim=-1)
-        env.goal_viz.write_root_pose_to_sim(pose, env_ids=env_ids)
+        env.goal_viz.write_root_pose_to_sim_index(root_pose=pose, env_ids=env_ids)
         return
 
     # Fixed-trajectory ablation: ignore goal_sampling_type, draw from the
@@ -339,15 +344,15 @@ def _reset_goal_pose(env, env_ids: torch.Tensor, mode: str) -> None:
         new_pos_local = env._fixed_traj_pos[traj_id, step_clamped]
         new_quat = env._fixed_traj_quat[traj_id, step_clamped]
         pose = torch.cat([new_pos_local + env_origins, new_quat], dim=-1)
-        env.goal_viz.write_root_pose_to_sim(pose, env_ids=env_ids)
+        env.goal_viz.write_root_pose_to_sim_index(root_pose=pose, env_ids=env_ids)
         return
 
     if mode == "delta":
-        prev_pos_local = env.goal_viz.data.root_pos_w[env_ids] - env_origins
-        prev_quat = env.goal_viz.data.root_quat_w[env_ids]
+        prev_pos_local = env.goal_viz.data.root_pos_w.torch[env_ids] - env_origins
+        prev_quat = env.goal_viz.data.root_quat_w.torch[env_ids]
         new_pos_local, new_quat = sample_delta_goal_pose(
             prev_pos=prev_pos_local,
-            prev_quat_wxyz=prev_quat,
+            prev_quat_xyzw=prev_quat,
             delta_distance=cfg.delta_goal_distance,
             delta_rotation_degrees=cfg.delta_rotation_degrees,
             mins=cfg.target_volume_mins,
@@ -366,7 +371,7 @@ def _reset_goal_pose(env, env_ids: torch.Tensor, mode: str) -> None:
         raise ValueError(f"unknown goal sampling mode: {mode}")
 
     pose = torch.cat([new_pos_local + env_origins, new_quat], dim=-1)
-    env.goal_viz.write_root_pose_to_sim(pose, env_ids=env_ids)
+    env.goal_viz.write_root_pose_to_sim_index(root_pose=pose, env_ids=env_ids)
 
 
 def _clear_goal_trackers(env, env_ids: torch.Tensor) -> None:
